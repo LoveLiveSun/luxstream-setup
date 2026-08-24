@@ -1,0 +1,21 @@
+# Tudi binarni instalateri - vidi installers/README.md za izvore i verzije.
+# VB-Audio ima ogranicenu redistribuciju, a ostalo nema smisla hostati.
+installers/vdd-driver/
+installers/vigembus/
+installers/vb-audio-cable/
+installers/moonlight-client/
+installers/sunshine/
+installers/_stari/
+
+# Zastarjeli dokumenti - cuvaju se lokalno, ne trebaju javno
+*.zastarjelo
+
+# Identitet i tajne ovog stroja - NIKAD u repozitorij
+*.pem
+sunshine_state.json
+luxstream-identity.txt
+
+# Radni ostaci
+*.bak-*
+*.log
+MANIFEST.txt

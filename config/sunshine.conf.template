@@ -1,0 +1,9 @@
+# Sunshine konfiguracija - provjerena na GPU-P gostu
+# output_name je RAZLICIT na svakom stroju; popunjava ga 02-sunshine-configure.ps1
+
+dd_configuration_option = ensure_only_display
+dd_resolution_option = auto
+output_name = {POPUNITI-SKRIPTOM}
+encoder = software
+sw_preset = superfast
+sw_tune = zerolatency
