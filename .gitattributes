@@ -1,0 +1,7 @@
+# Windows skripte moraju ostati CRLF - PowerShell 5.1 i cmd to ocekuju
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.md  text eol=lf
+*.ico binary
