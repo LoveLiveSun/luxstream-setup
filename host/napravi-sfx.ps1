@@ -131,5 +131,5 @@ try {
 } catch { Bad "icon could not be read: $($_.Exception.Message)" }
 
 Write-Host ''
-Write-Host '  Put Luxstream.exe on \\lux1\Programi - that is all the user needs.' -ForegroundColor Cyan
+Write-Host '  Put Luxstream.exe on \\server\share - that is all the user needs.' -ForegroundColor Cyan
 Write-Host ''

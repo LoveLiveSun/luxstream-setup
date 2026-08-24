@@ -6,7 +6,7 @@
     Postoji zato sto su jednolinijske naredbe kroz razne ljuske krhke - navodnici,
     `%` i `$_` znaju stradati pri kopiranju. Ovo se pokrene i s mreznog mjesta:
 
-      powershell -ExecutionPolicy Bypass -File \\lux1\Programi\brza-provjera.ps1
+      powershell -ExecutionPolicy Bypass -File \\server\share\brza-provjera.ps1
 
     Za punu provjeru po svim kategorijama koristi PROVJERA-prompt.md s Claudeom.
 #>

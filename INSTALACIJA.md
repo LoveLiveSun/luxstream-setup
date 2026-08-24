@@ -11,7 +11,7 @@ greške i bez ijednog upozorenja.
 
 ## 1. Kako se pokreće
 
-**Najlakše — jedan klik s mreže:** na novom VM-u otvori `\\lux1\Programi` i dvoklikni
+**Najlakše — jedan klik s mreže:** na novom VM-u otvori `\\server\share` i dvoklikni
 **`Luxstream-INSTALIRAJ.cmd`**. Sam traži ovlasti, kopira paket na `C:\Luxstream-setup`
 i pokrene instalaciju. Ništa se ne raspakirava ručno.
 

@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 rem ===================================================================
 rem  Luxstream - instalacija u jednom kliku
 rem
-rem  Stavi ovu datoteku na \\lux1\Programi, uz mapu sunshine-gpup-setup.
+rem  Stavi ovu datoteku na \\server\share, uz mapu sunshine-gpup-setup.
 rem  Na novom VM-u: dvoklik. Nista se ne raspakirava rucno.
 rem
 rem  Sto radi:
