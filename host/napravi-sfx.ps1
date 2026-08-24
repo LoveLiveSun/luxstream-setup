@@ -96,6 +96,7 @@ try {
     '-sfxDefault64.SFX',    # 64-BITNI modul. Zadani Default.SFX je 32-bitni, a
                             # tada se procesu System32 preusmjeri na SysWOW64 i
                             # pnputil/query " ne postoje ".
+    '-xDISTRIBUCIJA.md',    # interna biljeska o objavi - ne ide u paket
     '-ibck',                # u pozadini, bez prozora
     "-iicon$Ikona",         # vlastita ikona (samo WinRAR.exe, ne Rar.exe)
     "-z$konf",              # SFX konfiguracija
