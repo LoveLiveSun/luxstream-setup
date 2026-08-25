@@ -69,7 +69,7 @@ a cijeli krug traje satima.
 
 ### 3.1. Fork je napravljen
 
-`https://github.com/VjekoslavDugec/Luxstream` — `master` stoji na `0a1c365`,
+`https://github.com/VjekoslavDugec/Sunshine-wgc` — `master` stoji na `0a1c365`,
 istom commitu protiv kojeg je zakrpa pisana.
 
 ### 3.2. Uključi Actions na forku

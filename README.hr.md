@@ -35,7 +35,7 @@ IDXGIOutput1::DuplicateOutput()          -> 0x80070057
 GraphicsCaptureItem CreateForMonitor()   -> S_OK, kadrovi teku
 ```
 
-Fork: `VjekoslavDugec/Luxstream`. Postupak je u **[FORK.md](FORK.md)**.
+Fork: `VjekoslavDugec/Sunshine-wgc`. Postupak je u **[FORK.md](FORK.md)**.
 
 **Podjela poslova u konačnom rješenju:**
 

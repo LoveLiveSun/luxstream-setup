@@ -13,7 +13,7 @@ Ako nađeš kvar, opiši ga i predloži popravak — ali ne izvodi ga.
 ## Što je ovo
 
 Hyper-V gost s **GPU-P particijom** RTX 4090. Streaming ide preko zakrpanog Sunshinea
-(fork `VjekoslavDugec/Luxstream`) i Moonlighta. Paket je u `C:\Program Files\Luxstream`,
+(fork `VjekoslavDugec/Sunshine-wgc`) i Moonlighta. Paket je u `C:\Program Files\Luxstream`,
 dokumentacija u `INSTALACIJA.md`, `README.md`, `TODO.md`, `RADNA-POSTAVA.md`.
 
 ## Kategorije, s očekivanim vrijednostima

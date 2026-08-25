@@ -40,7 +40,7 @@ fails with `0x80070057` before capture even starts. Sunshine already has a compl
 WGC backend, but filters every output through a Desktop Duplication probe first, so
 WGC never runs. One patch removes that gate when `capture = wgc` is explicit.
 
-Fork: [`VjekoslavDugec/Luxstream`](https://github.com/VjekoslavDugec/Luxstream) —
+Fork: [`VjekoslavDugec/Sunshine-wgc`](https://github.com/VjekoslavDugec/Sunshine-wgc) —
 commits `5247ed93`, `09e108f8`, `8f3c1676`.
 
 ## Measured

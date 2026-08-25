@@ -35,7 +35,7 @@ Sunshine already ships a complete WGC backend — but every output is filtered t
 a Desktop Duplication probe first, so WGC never gets a chance. **One patch removes
 that gate when `capture = wgc` is set explicitly.**
 
-Patches live in the fork [`VjekoslavDugec/Luxstream`](https://github.com/VjekoslavDugec/Luxstream):
+Patches live in the fork [`VjekoslavDugec/Sunshine-wgc`](https://github.com/VjekoslavDugec/Sunshine-wgc):
 
 | Commit | What it does |
 |---|---|

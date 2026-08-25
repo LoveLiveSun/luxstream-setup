@@ -218,7 +218,7 @@ Pisano za staru arhitekturu (VDD na WARP-u, softverski enkoder). Treba prepisati
 
 ## 4. Prema upstreamu
 
-Fork: `VjekoslavDugec/Luxstream`, grana `master`.
+Fork: `VjekoslavDugec/Sunshine-wgc`, grana `master`.
 
 **Zakrpa 1 — gotova, dokazana, spremna za PR.** `test_capture_supported()` preskače Desktop
 Duplication probu uz eksplicitni `capture = wgc`. Kompajlirala se iz prve uz `-DBUILD_WERROR=ON`.

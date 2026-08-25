@@ -15,7 +15,7 @@ ovih binarnih datoteka (za objavu na GitHubu — vidi `DISTRIBUCIJA.md`).
 
 | Komponenta | Verzija | Proizvođač | Licenca |
 |---|---|---|---|
-| Sunshine (zakrpani) | `2026.821.103043` | LizardByte, fork `VjekoslavDugec/Luxstream` | GPL-3.0 |
+| Sunshine (zakrpani) | `2026.821.103043` | LizardByte, fork `VjekoslavDugec/Sunshine-wgc` | GPL-3.0 |
 | Virtual Display Driver | `11.30.4.434` (2024-12-24) | MikeTheTech | provjeri u izvoru |
 | ViGEmBus | `1.21.442.0` (2022-08-30) | Nefarius Software Solutions e.U. | provjeri u izvoru |
 | VB-Audio Virtual Cable | `3.3.1.7` driver / `2.1.5.8` instalater | VB-Audio Software | **donationware, ograničena redistribucija** |
@@ -31,7 +31,7 @@ redistribuciju instalatera ograničavaju.
 
 | Komponenta | Odakle |
 |---|---|
-| Sunshine (zakrpani) | Releases forka `VjekoslavDugec/Luxstream` (gradi ga `build-windows-only.yml`) |
+| Sunshine (zakrpani) | Releases forka `VjekoslavDugec/Sunshine-wgc` (gradi ga `build-windows-only.yml`) |
 | Virtual Display Driver | <https://github.com/VirtualDrivers/Virtual-Display-Driver> |
 | ViGEmBus | <https://github.com/nefarius/ViGEmBus> |
 | VB-Audio Virtual Cable | <https://vb-audio.com/Cable/> |
