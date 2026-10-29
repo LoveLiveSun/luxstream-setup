@@ -574,8 +574,8 @@ if ($vddDev -and $vddDev.Status -eq 'OK') {
   # klasa Display: {4d36e968-e325-11ce-bfc1-08002be10318}
   $r = [RootDev]::Create('4d36e968-e325-11ce-bfc1-08002be10318', 'DISPLAY', $vddHwid, $vddInf)
   if ($r -like 'OK*') { Ok "Virtual Display Driver installed $r"; Start-Sleep -Seconds 5 }
-   Vrati-Prozor   # topologija se promijenila - vrati konzolu na glavni zaslon
   else { Bad "Virtual Display Driver: $r" }
+  Vrati-Prozor   # topologija se promijenila - vrati konzolu na glavni zaslon
 } else { Bad "No $vddInf" }
 
 # --- ViGEmBus (gamepad) ---
@@ -733,8 +733,8 @@ if ($d) {
   }
   $stao.Stop()
   if ($mon) { Ok ("VDD reports a monitor (after {0:N0} s)" -f $stao.Elapsed.TotalSeconds) }
-   Vrati-Prozor   # topologija se promijenila - vrati konzolu na glavni zaslon
   else { Bad 'VDD does NOT report a monitor - the configuration broke it. Restore the .bak and try fewer modes.' }
+  Vrati-Prozor   # topologija se promijenila - vrati konzolu na glavni zaslon
 }
 
 # Citanje ProductVersion iz MSI baze preko msi.dll.
@@ -968,8 +968,11 @@ if ($guid) {
 if (Test-Path $conf) { Copy-Item $conf "$conf.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')" -Force }
 # Rezultat se MORA uhvatiti - inace $true padne u izlaz i u dnevniku se pojavi
 # goli "True" bez ikakva konteksta.
-if (-not (Zapisi-BezBom $conf $redci)) { Bad "sunshine.conf nije zapisan" }
-Ok 'sunshine.conf written (no BOM)'
+if (Zapisi-BezBom $conf $redci) {
+  Ok 'sunshine.conf written (no BOM)'
+} else {
+  Bad "sunshine.conf nije zapisan"
+}
 
 # zapamceno stanje displaya zna sadrzavati staru topologiju
 Remove-Item 'C:\Program Files\Sunshine\config\display_device.state' -ErrorAction SilentlyContinue
