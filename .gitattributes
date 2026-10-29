@@ -5,3 +5,6 @@
 *.vbs text eol=crlf
 *.md  text eol=lf
 *.ico binary
+# Zakrpe moraju ostati LF - git apply ih poredi s LF izvorima, a
+# autocrlf=true bi ih na Windowsu prepisao u CRLF i razbio kontekst.
+*.patch text eol=lf

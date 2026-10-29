@@ -488,11 +488,22 @@ $odZadnjeg = if (Test-Path $zadnjiPrimingDat) {
 } else { 999 }
 $pauza = if ($zadnjiUspio) { 1 } else { 10 }
 
-if (Tece-Stream) { Say 'Stream tece - priming ce ga nakratko prekinuti (tako je trazeno).' }
+# Je li stream u tijeku? Pita se JEDNOM - funkcija poziva nvidia-smi i TCP, pa
+# je ne treba vrtjeti dva puta.
+$teceStream = Tece-Stream
+if ($teceStream) { Say 'Stream tece - topologija se ne dira dok se klijent ne odspoji.' }
 
 $trebaPriming =
   if ($Reprime)        { Say 'Priming na zahtjev (-Reprime).'; $true }
   elseif (Radi-Vulkan) { $false }
+  # PRAVA BRANA, uvedena 29.10.2026. Do tada je Tece-Stream bio samo poruka, a
+  # priming je isao dalje i mijenjao topologiju usred streama - sto je korisniku
+  # obaralo rezoluciju s 5120x1440 na 1920x1080 (izmjereno 23.8.2026.).
+  # -Reprime ostaje iznad ove brane jer je to izricit zahtjev covjeka.
+  elseif ($teceStream) {
+    Say 'Vulkan ne radi, ali stream TECE - ne diram topologiju. Priming kad klijent odspoji.'
+    $false
+  }
   elseif ($odZadnjeg -lt $pauza) {
     Say ("Vulkan ne radi, ali priming je bio prije {0:N1} min (pauza {1} min) - cekam." -f $odZadnjeg, $pauza)
     $false
