@@ -18,6 +18,8 @@
         -NoviIdentitet      prisili nov certifikat i uniqueid (klon VM-a)
         -PreskociUiAccess   ne dira manifest ni potpis Sunshinea
         -PreskociAutoPrijavu ne postavlja automatsku prijavu
+        -PreskociMost       ne registrira most za meduspremnik i datoteke
+        -TajnaMosta "..."   zajednicka tajna mosta; inace se izgenerira i ispise
         -Gpu "ime"          ime GPU-a za VDD; inace se otkriva samo
 
     STO RADI, redom
@@ -27,7 +29,7 @@
       2. VDD konfiguracija  vezanje na GPU + lista modova, restart drivera
       3. Sunshine         instalacija zakrpanog builda
       4. Sunshine config  otkrivanje GUID-a displaya iz loga, pisanje sunshine.conf
-      5. zadaci           SunshineUser, StreamReady, RestoreConsoleSession
+      5. zadaci           SunshineUser, StreamReady, RestoreConsoleSession, LuxstreamBridge
       6. prilagodbe       DPI, Game Bar, (opcionalno) UAC
       7. priming i provjera
 
@@ -55,6 +57,8 @@ param(
   [switch]$NoviIdentitet,
   [switch]$PreskociUiAccess,
   [switch]$PreskociAutoPrijavu,
+  [switch]$PreskociMost,
+  [string]$TajnaMosta,
   [string]$Gpu
 )
 
@@ -414,7 +418,8 @@ if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
 # ============================================================ 0b. UGRADNJA PAKETA
 Head '0b. Installing the package'
 
-# Zadaci (SunshineUser, StreamReady, RestoreConsoleSession, VerifyAfterBoot)
+# Zadaci (SunshineUser, StreamReady, RestoreConsoleSession, VerifyAfterBoot,
+# LuxstreamBridge)
 # pokazuju na skripte APSOLUTNOM putanjom. Ako se instalater pokrene iz ZIP-a
 # raspakiranog na Desktopu, a ta se mapa poslije obrise, zadaci tiho prestanu
 # raditi. Zato paket ide na stalno mjesto i zadaci se registriraju ODANDE.
@@ -1097,6 +1102,39 @@ Ok 'Task RestoreConsoleSession registered'
 & (Join-Path $skripte 'verify-after-boot.ps1') -Install
 Ok 'Task VerifyAfterBoot registered'
 
+# --- LuxstreamBridge --- meduspremnik (tekst, slika, popis datoteka) i
+# prijenos datoteka izmedju ovog VM-a i klijenta.
+#
+# Sunshine i Moonlight ne dijele ni meduspremnik ni datoteke. To nije
+# postavka koja nedostaje, nego funkcija koje u protokolu NEMA: Sunshine
+# prenosi samo sliku, zvuk i ulaz. Most to rjesava obicnim TCP-om, IZVAN
+# protokola streama - pa radi s bilo kojom verzijom Sunshinea i Moonlighta.
+#
+# U ovom VM-u je KLIJENT, tj. strana koja se SPAJA. Razlog je adresa: host na
+# Default Switchu ima fiksnu 172.29.32.1, a adresa VM-a se mijenja (DHCP i
+# klonovi), pa bi se na hostu stalno morala prepisivati. Klijent bez -Peer
+# sam uzme zadani gateway, a to je na Default Switchu upravo host.
+#
+# Druga polovica (na HOSTU) se pokrece rucno - vidi zavrsni ispis.
+$skriptaMost = Join-Path $skripte 'luxstream-bridge.ps1'
+$konfMost = 'C:\ProgramData\Luxstream\bridge.json'
+if ($PreskociMost) {
+  Warn 'Bridge not registered (-PreskociMost): no clipboard, no file transfer'
+} elseif (Test-Path $skriptaMost) {
+  $mostParams = @{ Mode = 'Client' }
+  if ($TajnaMosta) { $mostParams.Secret = $TajnaMosta }
+  & $skriptaMost -Install @mostParams
+  Ok 'Task LuxstreamBridge registered (clipboard + files)'
+  # Zapisana tajna je izvor istine: i kad -TajnaMosta nije zadana, skripta ju
+  # je izgenerirala i zapisala. Cita se natrag da zavrsni ispis moze dati
+  # gotovu naredbu za host, bez prepisivanja.
+  if (Test-Path $konfMost) {
+    try { $script:mostTajna = (Get-Content $konfMost -Raw -Encoding UTF8 | ConvertFrom-Json).secret } catch { }
+  }
+} else {
+  Warn 'No luxstream-bridge.ps1 - clipboard and file transfer are not available'
+}
+
 # ============================================================ 6. PRILAGODBE
 Head '6. Tweaks'
 
@@ -1278,6 +1316,42 @@ Write-Host ''
 Write-Host '  3) CONNECT' -ForegroundColor Cyan
 Write-Host '     In Moonlight click the VM. Pairing is permanent - next time you'
 Write-Host '     just connect.'
+Write-Host ''
+Write-Host '  4) CLIPBOARD AND FILE TRANSFER (host <-> this VM)' -ForegroundColor Cyan
+Write-Host '     Sunshine and Moonlight share neither clipboard nor files - the'
+Write-Host '     streaming protocol has no such feature. A small bridge does it'
+Write-Host '     over plain TCP, outside the stream protocol, so it works with any'
+Write-Host '     Sunshine and Moonlight version.'
+Write-Host ''
+Write-Host '     This VM is already the CLIENT half (task LuxstreamBridge, starts'
+Write-Host '     at logon, reconnects by itself). You only need to start the other'
+Write-Host '     half ON THE HOST - once, from an elevated PowerShell:'
+Write-Host ''
+if ($mostTajna) {
+  Write-Host "       & 'C:\Program Files\Luxstream\scripts\luxstream-bridge.ps1' -Mode Server -Secret $mostTajna -Install"
+} else {
+  Write-Host '       & ''C:\Program Files\Luxstream\scripts\luxstream-bridge.ps1'' -Mode Server -Install'
+}
+Write-Host ''
+Write-Host '     and open the port on the host (once, also elevated):'
+Write-Host '       New-NetFirewallRule -DisplayName "Luxstream bridge" -Direction Inbound -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress 172.29.32.0/24'
+Write-Host ''
+Write-Host '     The same script must exist on the host. If you only unpacked this'
+Write-Host '     package in the VM, copy scripts\luxstream-bridge.ps1 to the host'
+Write-Host '     and run it from there.'
+Write-Host ''
+Write-Host '     HOW IT IS USED'
+Write-Host '       Copy text or an image on one side  ->  paste on the other side.'
+Write-Host '       Copy a FILE (Ctrl+C in Explorer)  ->  Ctrl+V on the other side'
+Write-Host '         pastes the file itself. It arrives in'
+Write-Host '         %USERPROFILE%\Luxstream\Primljeno\ .'
+Write-Host '       For anything large, use the folder instead: drop a file into'
+Write-Host '         %USERPROFILE%\Luxstream\Drop\ and it leaves that folder and'
+Write-Host '         appears in Luxstream\Primljeno\ on the other side.'
+Write-Host ''
+Write-Host '     Traffic is NOT encrypted. It is meant for this isolated LAN only,'
+Write-Host '     and the shared secret only stops accidental connections.'
+Write-Host '     Status:  powershell -ExecutionPolicy Bypass -File "C:\Program Files\Luxstream\scripts\luxstream-bridge.ps1" -Status'
 Write-Host ''
 Write-Host '  The Sunshine web UI needs no login:' -ForegroundColor Cyan
 Write-Host '       https://localhost:47990'

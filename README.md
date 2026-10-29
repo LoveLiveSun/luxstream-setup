@@ -57,6 +57,7 @@ The first is the actual fix. The others made the diagnosis possible.
 | OpenGL | 4.6, native NVIDIA |
 | Direct3D 12 | native, full VRAM |
 | Host CPU | ~5 % while streaming |
+| Clipboard &amp; files | text, images and files both ways, outside the stream protocol |
 
 ---
 
@@ -123,7 +124,7 @@ clients are paired.
 | 2 | VDD configuration: bound to the NVIDIA GPU, 11 verified resolutions |
 | 3 | patched Sunshine, and verifies the build really contains the patches |
 | 4 | discovers the VDD display GUID from the log, writes `sunshine.conf` |
-| 5 | four scheduled tasks |
+| 5 | five scheduled tasks |
 | 6 | DPI, Game Bar, **UIAccess**, automatic logon, UAC |
 | 7 | graphics priming and verification |
 
@@ -180,7 +181,89 @@ on the machine — it includes the traps that produce false conclusions.
 
 ---
 
-## Known limitations
+## Clipboard and file transfer (host &lt;-&gt; VM)
+
+**Sunshine and Moonlight share neither clipboard nor files.** This is not a missing
+setting — the streaming protocol has no such feature. `sunshine.exe` contains no
+reference at all to the Windows clipboard API (`OpenClipboard`, `SetClipboardData`,
+`CF_UNICODETEXT` are all zero). RDP has it because RDP is a remote *desktop* protocol
+with virtual channels; Moonlight carries only picture, sound and input.
+
+> **Do not solve this with a parallel RDP session.** RDP moves the console session to
+> itself, the VDD disappears and Sunshine is left with no picture.
+
+`scripts\luxstream-bridge.ps1` fills the gap **outside** the stream protocol, over plain
+TCP, so it works with any Sunshine and Moonlight version:
+
+| What | How |
+|---|---|
+| text | copy on one side, paste on the other |
+| image (PNG) | same, through the clipboard |
+| **file copied in Explorer** | Ctrl+C on a file, Ctrl+V on the other side pastes the file itself |
+| **file via a folder** | drop it into `%USERPROFILE%\Luxstream\Drop\`; it leaves that folder and appears in `Luxstream\Primljeno\` on the other side |
+
+### Host listens, VM connects
+
+The host on the *Default Switch* has a **fixed** address (`172.29.32.1`); a VM's address
+changes (DHCP, clones), so it would have to be rewritten on the host constantly. A client
+without `-Peer` simply uses the default gateway — which on the Default Switch is the host.
+
+On the **host**, once, from an elevated PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName 'Luxstream bridge' -Direction Inbound `
+  -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress 172.29.32.0/24
+
+.\scripts\luxstream-bridge.ps1 -Mode Server -Install
+```
+
+`-Install` writes `C:\ProgramData\Luxstream\bridge.json`, generates a shared secret,
+prints it and registers the `LuxstreamBridge` task at logon. The installer in the VM
+already registers the client half; pass the host's secret to it so both sides match:
+
+```powershell
+.\INSTALL.ps1 -TajnaMosta 'secret-from-the-host'
+```
+
+(Without it the installer generates its own and prints a ready-made host command at the
+end.) Manual equivalent on the VM:
+
+```powershell
+.\scripts\luxstream-bridge.ps1 -Mode Client -Secret '<secret-from-the-host>' -Install
+```
+
+**Do not run it as a Windows service** — a service lives in session 0, where the user's
+clipboard is invisible.
+
+### Check it
+
+```powershell
+# is it running, what is configured, last 15 log lines
+.\scripts\luxstream-bridge.ps1 -Status
+
+# self-test with no outside connection - real TCP on 127.0.0.1: text with
+# diacritics both ways, a PNG, a 700 KB file crossing the 256 KB chunk
+# boundary (MD5), and name sanitising
+.\scripts\luxstream-bridge.ps1 -SelfTest
+```
+
+Log: `%USERPROFILE%\Luxstream\luxstream-bridge.log`. It also records **why the bridge did
+not start** (missing secret, for instance) — otherwise a failure inside a hidden
+scheduled task would be completely silent.
+
+### Limitations
+
+- Traffic is **not encrypted**. The shared secret only prevents accidental connections.
+  Intended for a trusted LAN.
+- Folders are **not sent recursively** — files only. Archive a folder, or copy into
+  `Drop\` in several passes.
+- Caps: text 1 MB, image 16 MB, 64 MB total per clipboard file group, 4 GB per `Drop\`
+  file, 64 MB per frame.
+- Names are sanitised (any path stripped, `<>:"|?*` and control characters become `_`,
+  truncated to 180 chars); collisions get a `-1`, `-2`… suffix.
+- It needs an **interactive session**. As a service it does nothing — silently.
+
+---
 
 - **Gamepad is untested** with a real controller. ViGEmBus installs and is healthy;
   `x360` and `ds4` profiles should work. Exotic profiles need `libvirtualhid`, which

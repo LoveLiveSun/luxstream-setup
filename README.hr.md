@@ -308,41 +308,84 @@ ali je lokalan svakom VM-u pa ne stvara nikakav problem.
 
 ---
 
-## 5b. Međuspremnik (copy/paste) između VM-a i klijenta
+## 5b. Međuspremnik i datoteke između VM-a i klijenta
 
-**Sunshine i Moonlight nemaju dijeljenje međuspremnika.** To nije postavka koja nedostaje —
-funkcije u protokolu nema. Provjereno: `sunshine.exe` nema nijednu referencu na Windows
-clipboard API (`OpenClipboard`, `SetClipboardData`, `CF_UNICODETEXT` — sve nula). RDP to ima
-jer je remote *desktop* protokol s virtualnim kanalima; Moonlight prenosi samo sliku, zvuk i ulaz.
+**Sunshine i Moonlight ne dijele ni međuspremnik ni datoteke.** To nije postavka koja
+nedostaje — funkcije u protokolu nema. Provjereno: `sunshine.exe` nema nijednu referencu na
+Windows clipboard API (`OpenClipboard`, `SetClipboardData`, `CF_UNICODETEXT` — sve nula).
+RDP to ima jer je remote *desktop* protokol s virtualnim kanalima; Moonlight prenosi samo
+sliku, zvuk i ulaz.
 
 > **Ne rješavaj to usporednim RDP-om.** RDP preseli konzolnu sesiju sebi, VDD nestane i
 > Sunshine ostane bez slike.
 
-### Rješenje: `scripts\clipboard-bridge.ps1`
+### Rješenje: `scripts\luxstream-bridge.ps1`
 
-Dvosmjerna sinkronizacija tekstualnog međuspremnika preko TCP-a. Klijent inicira vezu, pa
-se IP klijenta ne mora nigdje upisivati.
+Dvosmjerni most preko običnog TCP-a, **izvan** protokola streama — pa radi s bilo kojom
+verzijom Sunshinea i Moonlighta. Prenosi:
 
-**Na VM-u** (jednom otvori port, ograničeno na LAN):
+| Vrsta | Kako se koristi |
+|---|---|
+| tekst | kopiraj na jednoj strani, zalijepi na drugoj |
+| slika (PNG) | isto, kroz međuspremnik |
+| **datoteka iz međuspremnika** | Ctrl+C na datoteku u Exploreru → Ctrl+V na drugoj strani zalijepi samu datoteku |
+| **datoteka preko mape** | baci datoteku u `%USERPROFILE%\Luxstream\Drop\` → nestane odatle i pojavi se u `Luxstream\Primljeno\` na drugoj strani |
+
+Most zamjenjuje stari `clipboard-bridge.ps1`, koji je prenosio samo tekst.
+
+### Koja strana sluša
+
+**Host sluša, VM se spaja.** Host na *Default Switchu* ima fiksnu adresu `172.29.32.1`; adresa
+VM-a se mijenja (DHCP i klonovi), pa bi se na hostu stalno morala prepisivati. Klijent bez
+`-Peer` sam uzme zadani gateway — a to je na Default Switchu upravo host.
+
+**Na HOSTU** (jednom, iz povišenog PowerShella):
 
 ```powershell
-New-NetFirewallRule -DisplayName 'Clipboard bridge' -Direction Inbound `
-  -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress 192.168.0.0/16
+New-NetFirewallRule -DisplayName 'Luxstream bridge' -Direction Inbound `
+  -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress 172.29.32.0/24
+
+.\scripts\luxstream-bridge.ps1 -Mode Server -Install
 ```
+
+`-Install` zapiše konfiguraciju u `C:\ProgramData\Luxstream\bridge.json`, izgenerira
+zajedničku tajnu, ispiše ju i registrira zadatak `LuxstreamBridge` koji se pokreće pri prijavi.
+**Tajna mora biti ista na obje strane** — pokreni `-Install` na hostu, prepiši ispisanu tajnu, pa
+je na VM-u predaj kao `-TajnaMosta`:
 
 ```powershell
-.\scripts\clipboard-bridge.ps1 -Mode Server -Secret 'tvoja-tajna'
+.\INSTALL.ps1 -TajnaMosta 'tajna-s-hosta'
 ```
 
-**Na klijentu:**
+(Bez `-TajnaMosta` instalater izgenerira svoju i ispiše gotovu naredbu za host na kraju.)
+
+Bez instalera, ručno:
 
 ```powershell
-.\clipboard-bridge.ps1 -Mode Client -Server 192.168.6.220 -Secret 'tvoja-tajna'
+.\scripts\luxstream-bridge.ps1 -Mode Client -Secret '<tajna-s-hosta>' -Install
 ```
 
-Za automatsko pokretanje stavi prečac u *Startup* mapu (`shell:startup`) na obje strane.
+`-Install` na obje strane radi isto: registrira zadatak pri prijavi. Proces se pali kroz
+`luxstream-bridge-hidden.vbs`, jer Task Scheduler pokretanjem `powershell.exe` nakratko
+prikaže konzolni prozor — i to unatoč `-WindowStyle Hidden`.
+
 **Ne postavljaj ga kao Windows servis** — servis radi u sesiji 0 i ondje nema pristup
 međuspremniku korisnika.
+
+### Provjera
+
+```powershell
+# radi li, koja je konfiguracija, zadnjih 15 redaka dnevnika
+.\scripts\luxstream-bridge.ps1 -Status
+
+# samotest bez ikakve vanjske veze - pravi TCP spoj na 127.0.0.1:
+# tekst s dijakriticima u oba smjera, PNG, datoteka od 700 KB preko granice
+# komada od 256 KB (MD5), i sanitizacija imena
+.\scripts\luxstream-bridge.ps1 -SelfTest
+```
+
+Dnevnik je `%USERPROFILE%\Luxstream\luxstream-bridge.log`. Zapisuje se i **razlog zašto most
+nije krenuo** (npr. nema tajne) — inače bi kvar iz zakazanog zadatka bio potpuno nevidljiv.
 
 ### Zašto je izvedeno preko STA runspacea
 
@@ -351,15 +394,34 @@ zakazani zadaci i pozadinski procesi znaju biti **MTA**, gdje se međuspremnik *
 pročita ni ne postavi — bez ijedne greške. Zato skripta drži jedan trajni STA runspace i sav
 pristup ide kroz njega. Provjereno u oba smjera, uz hrvatske dijakritike.
 
+Uz to su dvije zamke ugrađene u samotest kao trajne provjere:
+
+- STA skripta ne smije kao završni izraz ispisati polje — PowerShell ga razvuče, pa se od
+  `byte[]` (PNG) vrati samo prvi bajt. Tada i „duljina > 50" i „preneseno identično" ispadnu
+  besmislene, ali ne i vidljivo pogrešne.
+- `.BaseObject` na običnom hashtableu ili `byte[]` vraća `$null`. „Sigurnosno" raspetljavanje
+  `if ($x -is [PSObject]) { $x = $x.BaseObject }` tiho obriše upravo ono što se prenosi.
+
+### Redoslijed čitanja međuspremnika
+
+Namjerno **datoteke → tekst → slika**. Kopiranje datoteke u Exploreru postavlja `CF_HDROP`,
+ali često i `CF_UNICODETEXT` s putanjom; da tekst ide prvi, poslala bi se samo putanja, a
+datoteka ne. PNG se pri ponovnom kodiranju ne dobije bajt-identičan, pa se nakon mrežnog
+zapisa međuspremnik **ponovno pročita** i zapamti novi hash — uz prozor od 1,5 s. Bez toga bi
+lokalna anketa vidjela vlastiti zapis kao „novo" i poslala ga natrag u petlji.
+
 ### Ograničenja
 
-- Prenosi **samo tekst**, najviše 1 MB. Ne prenosi slike ni datoteke.
-- Promet **nije kriptiran**. Namijenjeno povjerljivom LAN-u. Za lozinke i osjetljive podatke
-  koristi dijeljenu mapu, ne ovaj most.
-- `-Secret` je zajednička tajna; poslužitelj odbija vezu bez nje, a `-AllowedClients`
-  dodatno ograničava po IP prefiksu (zadano `192.168.`).
-
-Za **datoteke** i dalje koristi dijeljenu mapu — most je za kratke tekstove.
+- Promet **nije kriptiran**. Zajednička tajna u `HELLO` samo sprječava slučajan spoj, ne
+  prisluškivanje. Namijenjeno povjerljivom LAN-u.
+- Mape se **ne prenose rekurzivno** — samo datoteke. Za mapu koristi arhivu ili kopiraj u
+  `Drop\` u više prolaza.
+- Granice: tekst 1 MB, slika 16 MB, ukupno pri copy/paste datoteka 64 MB, pojedinačna
+  datoteka iz `Drop\` 4 GB, okvir 64 MB.
+- Ime se sanira (odbacuje se svaka putanja, `<>:"|?*` i upravljački znakovi idu u `_`,
+  skraćuje na 180 znakova), a kolizija dobiva sufiks `-1`, `-2`…
+- Radi **samo u interaktivnoj sesiji**. Kao servis ne radi — tiho, bez greške.
+- `-AllowedClients` ograničava po IP prefiksu (zadano `172.29.`, `192.168.`, `10.`, `127.`).
 
 ---
 
@@ -476,7 +538,9 @@ scripts/
   d3d12test.ps1 / d3d12features.ps1  D3D12 po adapteru
   gfx-status.ps1                 CIJELA graficka slika u jednoj naredbi
   setup-mesa-graphics.ps1        postavlja Mesu: OpenGL d3d12/llvmpipe + Vulkan Dozen
-  clipboard-bridge.ps1           dvosmjerni most za meduspremnik VM <-> klijent
+  luxstream-bridge.ps1           most za meduspremnik (tekst, slika, datoteke) i
+                                 prijenos datoteka, VM <-> klijent; -Install/-Status/-SelfTest
+  luxstream-bridge-hidden.vbs    pali most bez bljeska konzolnog prozora
   set-primary.ps1                programska promjena primarnog monitora
 host/
   gpu-p-setup.ps1                naredbe za Hyper-V host
