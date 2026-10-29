@@ -335,15 +335,17 @@ if ($biosUuid -and (Test-Path $pecatDat)) {
 }
 
 # 2. Hyper-V ADAPTER mora biti ukljucen. Bez njega nema ICD-a uopce.
-$hv = Get-PnpDevice -FriendlyName 'Microsoft Hyper-V Video' -ErrorAction SilentlyContinue
-if (-not $hv) {
-  Say 'UPOZORENJE: Microsoft Hyper-V Video adapter ne postoji.'
-} elseif ($hv.Status -ne 'OK') {
-  Say "Hyper-V adapter je u stanju '$($hv.Status)' - ukljucujem."
-  Enable-PnpDevice -InstanceId $hv.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+# Ime je lokalizirano ("Microsoft Hyper-V 视频" na kineskom) - vidi INSTALL.ps1.
+$hv = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -notmatch 'VEN_1414' -and ($_.FriendlyName -match 'Hyper-V' -or $_.InstanceId -like 'VMBUS\*') })
+if ($hv.Count -eq 0) {
+  Say 'UPOZORENJE: Hyper-V display adapter ne postoji.'
+} elseif ($hv[0].Status -ne 'OK') {
+  Say "Hyper-V adapter ($($hv[0].FriendlyName)) je u stanju '$($hv[0].Status)' - ukljucujem."
+  Enable-PnpDevice -InstanceId $hv[0].InstanceId -Confirm:$false -ErrorAction SilentlyContinue
   Start-Sleep -Seconds 10
 } else {
-  Say 'Hyper-V adapter: OK.'
+  Say "Hyper-V adapter: OK ($($hv[0].FriendlyName))."
 }
 
 # 3. PRIMING

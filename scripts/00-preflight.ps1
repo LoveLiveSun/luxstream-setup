@@ -44,7 +44,7 @@ if ($cs.NumberOfLogicalProcessors -lt 8) {
 
 Head 'GPU-P particija'
 $gpus = Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue |
-          Where-Object { $_.FriendlyName -notmatch 'Virtual Display|Hyper-V|Basic' }
+          Where-Object { $_.FriendlyName -notmatch 'Virtual Display|Hyper-V|Basic|基本显示' }
 if ($gpus) {
   foreach ($g in $gpus) { Ok "Prisutan: $($g.FriendlyName)  [$($g.Status)]" }
 } else {
@@ -52,7 +52,7 @@ if ($gpus) {
 }
 
 $phantom = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
-             Where-Object { $_.Problem -eq 'CM_PROB_PHANTOM' -and $_.FriendlyName -notmatch 'Virtual Display|Hyper-V|Basic' }
+             Where-Object { $_.Problem -eq 'CM_PROB_PHANTOM' -and $_.FriendlyName -notmatch 'Virtual Display|Hyper-V|Basic|基本显示' }
 if ($phantom) {
   Warn "$($phantom.Count) fantomskih GPU zapisa (CM_PROB_PHANTOM). Bezopasno, ali znak da je particija ranije nestajala."
 }

@@ -106,17 +106,20 @@ if ($HighPerformance) {
 
 # ---------------------------------------------------- prikaci Hyper-V monitor
 Head 'Prikacujem Hyper-V monitor'
-$hv = Get-PnpDevice -FriendlyName 'Microsoft Hyper-V Video' -ErrorAction SilentlyContinue
-if (-not $hv) { throw 'Microsoft Hyper-V Video adapter ne postoji u ovom VM-u.' }
+# Ime ovog uredjaja je lokalizirano ("Microsoft Hyper-V 视频" na kineskom), pa
+# fiksni engleski naziv promasuje uredjaj. Detalje vidi u INSTALL.ps1.
+$hv = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -notmatch 'VEN_1414' -and ($_.FriendlyName -match 'Hyper-V' -or $_.InstanceId -like 'VMBUS\*') })
+if ($hv.Count -eq 0) { throw 'Hyper-V display adapter ne postoji u ovom VM-u.' }
 
-$wasDisabled = ($hv.Status -ne 'OK')
-if ($wasDisabled) { Enable-PnpDevice -InstanceId $hv.InstanceId -Confirm:$false; Start-Sleep -Seconds 6 }
+$wasDisabled = ($hv[0].Status -ne 'OK')
+if ($wasDisabled) { Enable-PnpDevice -InstanceId $hv[0].InstanceId -Confirm:$false; Start-Sleep -Seconds 6 }
 
 if ((Get-MonitorNames) -notcontains 'HyperVMonitor') {
   # adapter je tu ali monitor nije u topologiji - restart uredaja ga vrati
-  Disable-PnpDevice -InstanceId $hv.InstanceId -Confirm:$false
+  Disable-PnpDevice -InstanceId $hv[0].InstanceId -Confirm:$false
   Start-Sleep -Seconds 5
-  Enable-PnpDevice  -InstanceId $hv.InstanceId -Confirm:$false
+  Enable-PnpDevice  -InstanceId $hv[0].InstanceId -Confirm:$false
   Start-Sleep -Seconds 12
   Start-Process -FilePath "$env:WINDIR\System32\DisplaySwitch.exe" -ArgumentList '/extend' -Wait
   Start-Sleep -Seconds 8

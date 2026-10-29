@@ -345,8 +345,20 @@ $nv  = Get-ChildItem $hds -Directory -Filter 'nv_dispi.inf_*' -ErrorAction Silen
 if ($nv) { Ok "Driver in guest: $($nv[0].Name)" }
 else     { Bad "No NVIDIA driver in $hds. Copy it from the host (must be the SAME version)." }
 
-$hv = Get-PnpDevice -FriendlyName 'Microsoft Hyper-V Video' -ErrorAction SilentlyContinue
-if ($hv -and $hv.Status -eq 'OK') { Ok 'Microsoft Hyper-V Video adapter is present' }
+# Ime ovog uredjaja je LOKALIZIRANO i zato se NE smije matchati cijeli engleski
+# naziv. Na kineskom Windowsu pise "Microsoft Hyper-V 视频", na hrvatskom
+# "Microsoft Hyper-V Video". Vidjeno 29.10.2026. na kineskom gostu (Win10
+# 19045): preflight je stao na laznoj gresci "No Hyper-V Video adapter" iako je
+# adapter bio prisutan i ispravan. "Hyper-V" je zastitni znak i prevoditelji ga
+# ne diraju, pa je on pouzdan kljuc; VMBUS instanca je rezerva za slucaj da i
+# to jednom bude prevedeno.
+#
+# VEN_1414&DEV_008E se izuzima jer je i GPU-P virtual render driver display
+# uredjaj - on je "ona druga" polovica i ne smije se zamijeniti s ovom.
+$hv = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -notmatch 'VEN_1414' -and ($_.FriendlyName -match 'Hyper-V' -or $_.InstanceId -like 'VMBUS\*') })
+if ($hv.Count -gt 0 -and $hv[0].Status -eq 'OK') { Ok "Hyper-V display adapter: $($hv[0].FriendlyName)" }
+elseif ($hv.Count -gt 0) { Bad "Hyper-V display adapter ($($hv[0].FriendlyName)) is in state '$($hv[0].Status)', not OK" }
 else { Bad 'No Hyper-V Video adapter. Without it there is no native Vulkan or OpenGL.' }
 
 if ($greske -gt 0) { Write-Host "`n$greske prerequisite(s) not met. Stopping." -ForegroundColor Red; return }

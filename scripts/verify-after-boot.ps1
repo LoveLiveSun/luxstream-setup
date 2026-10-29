@@ -67,7 +67,9 @@ W ''
 
 W '--- 3b. PRIMING ---'
 W "  marker: $(if (Test-Path 'C:\Users\Public\streamready-primed.txt') { (Get-Content 'C:\Users\Public\streamready-primed.txt' -Raw).Trim() } else { 'NEMA - priming se nije izvrsio' })"
-W "  Hyper-V adapter: $((Get-PnpDevice -FriendlyName 'Microsoft Hyper-V Video' -ErrorAction SilentlyContinue).Status)"
+$hv = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -notmatch 'VEN_1414' -and ($_.FriendlyName -match 'Hyper-V' -or $_.InstanceId -like 'VMBUS\*') })
+W "  Hyper-V adapter: $(if ($hv.Count -eq 0) { 'NEMA' } else { "$($hv[0].FriendlyName) [$($hv[0].Status)]" })"
 W ''
 W '--- 4. ZADACI ---'
 foreach ($n in 'SunshineUser','StreamReady','RestoreConsoleSession') {
