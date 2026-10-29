@@ -778,9 +778,14 @@ if (-not (Test-Path $msi)) {
   # datoteke koja se preslikava nize, pa je i upstream MSI posve dovoljan kao
   # osnova - nosi servis, skripte, assets, firewall i alate, a jedino sto se
   # mijenja je sam sunshine.exe.
-  $kand = @(Get-ChildItem (Join-Path $instal 'sunshine') -Filter '*.msi' -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending)
+  #
+  # Redoslijed nije proizvoljan: ime koje sadrzi "patched" ima prednost, jer bi
+  # abecedno `Sunshine-Windows-AMD64-installer.msi` inace pobijedilo
+  # `Luxstream-Sunshine-patched.msi` i instalirala bi se pogresna osnova
+  # (upstream verzija bez naseg potpisa i s drugim ProductCode-om).
+  $kand = @(Get-ChildItem (Join-Path $instal 'sunshine') -Filter '*.msi' -ErrorAction SilentlyContinue)
   if ($kand.Count -gt 0) {
+    $kand = @($kand | Sort-Object @{ Expression = { if ($_.Name -match 'patched') { 0 } else { 1 } } }, Name)
     $msi = $kand[0].FullName
     Inf "Using $($kand[0].Name) as the Sunshine base installer"
   }
