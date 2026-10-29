@@ -124,3 +124,24 @@ Write-Host "Sve sesije odspojene -> vracam sesiju $($target.Id) ($($target.User)
 Start-Sleep -Seconds 3
 Write-Host "`nStanje nakon vracanja:"
 (query user) 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+# ---------------------------------------------------------------------------
+# Sunshine se MORA pokrenuti ponovno.
+#
+# Dok je sesija bila udaljena (RDP ili Hyper-V "poboljsana sesija"), njezina
+# topologija displaya sadrzi SAMO RDP indirektni display. Sunshine koji je u
+# tom trenutku radio zapamtio je da njegov output_name GUID ne postoji i svaki
+# pokusaj streama zavrsava s DevicePrepFailed - i tako ostaje i nakon sto se
+# sesija vrati na konzolu, jer se proces nije promijenio.
+#
+# Vidjeno 29.10.2026.: gost otvoren poboljsanom sesijom u 20:21, Sunshine se
+# u njoj podigao u 20:21:54, i od tada "prvi spoj radi, svaki sljedeci ne".
+# Restart ovdje je ono sto tu petlju prekida.
+# ---------------------------------------------------------------------------
+Write-Host 'Restarting Sunshine so it re-enumerates the console displays...'
+Get-Process sunshine -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 4
+Start-ScheduledTask -TaskName 'SunshineUser' -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 8
+$p = Get-Process sunshine -ErrorAction SilentlyContinue
+Write-Host "  sunshine: $(if ($p) { "PID $($p.Id)" } else { 'NIJE SE PODIGAO' })"

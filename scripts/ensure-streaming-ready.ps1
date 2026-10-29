@@ -280,9 +280,31 @@ public class SESIJA2 {
 }
 '@
 }
+# Ova grana je 29.10.2026. bila NEVIDLJIVA i to je bio najveci problem: kad je
+# gost otvoren preko Hyper-V "poboljsane sesije" (Enhanced Session), to je za
+# Windows obican RDP. Udaljena sesija ima DRUGU topologiju displaya - VDD nije u
+# njoj, Sunshine ga ne vidi, output_name GUID ne postoji i svaki streaming
+# zavrsi s DevicePrepFailed. Watchdog je u tom stanju svake minute tiho izlazio:
+# u priming-dijagnostika.log se samo PREKINUO niz redaka, bez ijedne rijec
+# objasnjenja. Iz toga se ne da zakljuciti nista. Zato se sada prijelaz u
+# udaljenu sesiju (i povratak u lokalnu) zapisuje - jednom, na prijelazu, da
+# dnevnik ne raste u nedogled.
+$daljDat = 'C:\Users\Public\streamready-udaljena.txt'
 if ([SESIJA2]::Udaljena()) {
   Say 'Sesija je udaljena (RDP) - displayi su drugi, preskacem.'
+  if (-not (Test-Path $daljDat)) {
+    $r = '{0}  {1,-22} UDALJENA SESIJA (RDP / Hyper-V poboljsana sesija) - VDD nije u topologiji sesije, streaming ne moze raditi' -f `
+           (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), 'udaljena-sesija'
+    Add-Content -Path 'C:\Users\Public\priming-dijagnostika.log' -Value $r -Encoding UTF8
+    Set-Content -Path $daljDat -Value (Get-Date).ToString('o') -Encoding ASCII
+  }
   return
+}
+if (Test-Path $daljDat) {
+  Remove-Item $daljDat -Force -ErrorAction SilentlyContinue
+  $r = '{0}  {1,-22} sesija je opet lokalna (konzola) - nastavljam s primingu' -f `
+         (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), 'lokalna-sesija'
+  Add-Content -Path 'C:\Users\Public\priming-dijagnostika.log' -Value $r -Encoding UTF8
 }
 
 Dijagnostika 'na-pocetku'
