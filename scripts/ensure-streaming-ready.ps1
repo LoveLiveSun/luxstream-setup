@@ -219,6 +219,36 @@ function Tece-Stream {
   return $false
 }
 
+function Klijent-Spojen {
+  # Je li Moonlight spojen ili se upravo spaja?
+  #
+  # Zasto TCP, a ne Sunshineov dnevnik: ovo se mora moci provjeriti i u
+  # UDALJENOJ sesiji, a tamo Tece-Stream ne pomaze - njegov nvidia-smi u GPU-P
+  # gostu cesto vrati "No devices were found" (izmjereno 29.10.2026.), pa je
+  # Tece-Stream ondje trajno $false. TCP veza na Sunshineov port postoji
+  # neovisno o tome vidi li driver GPU.
+  #
+  # 48010 = RTSP (spajanje), 47984 = HTTPS upravljanje, 47989 = HTTP,
+  # 47990 = web UI. Established na bilo kojem znaci da klijent nesto radi.
+  $portovi = @(47984, 47989, 47990, 48010)
+  try {
+    $v = @(Get-NetTCPConnection -State Established -ErrorAction Stop |
+           Where-Object { $portovi -contains [int]$_.LocalPort })
+    return $v.Count -gt 0
+  } catch { return $false }
+}
+
+function Dnevnik-Glasno {
+  # Uokviren zapis u priming-dijagnostika.log. Obicni redci su jednolinijski i
+  # u masi se lako previde; ovaj se ne moze previdjeti.
+  param([string]$Naslov, [string[]]$Tekst)
+  $crta = '=' * 78
+  $l = @('', $crta, "!!! $Naslov")
+  foreach ($t in $Tekst) { $l += "!!! $t" }
+  $l += $crta
+  Add-Content -Path 'C:\Users\Public\priming-dijagnostika.log' -Value $l -Encoding UTF8
+}
+
 function Radi-Vulkan {
   # Izravno pitanje umjesto posrednog pokazatelja: radi li Vulkan uopce?
   # Ako radi, priming ne treba - bez obzira sto se s displayima dogadjalo.
@@ -289,7 +319,8 @@ public class SESIJA2 {
 # objasnjenja. Iz toga se ne da zakljuciti nista. Zato se sada prijelaz u
 # udaljenu sesiju (i povratak u lokalnu) zapisuje - jednom, na prijelazu, da
 # dnevnik ne raste u nedogled.
-$daljDat = 'C:\Users\Public\streamready-udaljena.txt'
+$daljDat  = 'C:\Users\Public\streamready-udaljena.txt'
+$daljUpoz = 'C:\Users\Public\streamready-udaljena-upozorenje.txt'
 if ([SESIJA2]::Udaljena()) {
   Say 'Sesija je udaljena (RDP) - displayi su drugi, preskacem.'
   if (-not (Test-Path $daljDat)) {
@@ -298,10 +329,41 @@ if ([SESIJA2]::Udaljena()) {
     Add-Content -Path 'C:\Users\Public\priming-dijagnostika.log' -Value $r -Encoding UTF8
     Set-Content -Path $daljDat -Value (Get-Date).ToString('o') -Encoding ASCII
   }
+
+  # KLIJENT SE SPAJA, A SESIJA JE UDALJENA.
+  # Ovo je jedini trenutak u kojem se korisniku moze reci ZASTO ne moze spojiti,
+  # i to u istoj datoteci u koju ce otici i sam neuspjeh. Bez ovoga se vidi samo
+  # "Moonlight: greska 503" i dnevnik u kojem nista ne pise.
+  # Najvise jedan blok svakih 5 minuta, da dnevnik ne naraste.
+  if (Klijent-Spojen) {
+    $staro = $true
+    if (Test-Path $daljUpoz) {
+      $prije = (Get-Content $daljUpoz -Raw).Trim()
+      if ($prije) { try { $staro = (((Get-Date) - [datetime]::Parse($prije)).TotalMinutes -ge 5) } catch { $staro = $true } }
+    }
+    if ($staro) {
+      Dnevnik-Glasno 'STREAMING NE MOZE RADITI - SESIJA JE UDALJENA (RDP / Hyper-V poboljsana sesija)' @(
+        'Moonlight se upravo spaja, a ova Windows sesija je UDALJENA.',
+        '',
+        'Udaljena sesija ima DRUGU topologiju displaya: u njoj je samo RDP',
+        'indirektni display, a virtualni display (VDD) NIJE. Sunshine zato ne',
+        'moze naci display koji mu je zadan u output_name i svaki spoj zavrsi s',
+        '  "Display device configuration failed with result: DevicePrepFailed"',
+        'sto Moonlight prikaze kao gresku 503.',
+        '',
+        'RJESENJE: zatvori prozor poboljsane sesije i koristi osnovnu sesiju.',
+        'Sesija se tada vraca na konzolu sama (zadatak RestoreConsoleSession) i',
+        'Sunshine se ponovno pokrene. Provjera da je stanje dobro:',
+        '  [System.Windows.Forms.SystemInformation]::TerminalServerSession -> False'
+      )
+      Set-Content -Path $daljUpoz -Value (Get-Date).ToString('o') -Encoding ASCII
+    }
+  }
   return
 }
 if (Test-Path $daljDat) {
   Remove-Item $daljDat -Force -ErrorAction SilentlyContinue
+  Remove-Item $daljUpoz -Force -ErrorAction SilentlyContinue
   $r = '{0}  {1,-22} sesija je opet lokalna (konzola) - nastavljam s primingu' -f `
          (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), 'lokalna-sesija'
   Add-Content -Path 'C:\Users\Public\priming-dijagnostika.log' -Value $r -Encoding UTF8
