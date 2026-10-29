@@ -79,7 +79,8 @@ Do not close anything.
 
 When it finishes, the Hyper-V display becomes secondary, so in Basic Session
 you will see the desktop but will not be able to control it. That is your
-signal to switch to Enhanced Session or RDP and finish pairing with Moonlight.
+signal to switch to Enhanced Session or RDP so you can operate the VM and click
+the host in Moonlight - pairing completes on its own, with no PIN.
 }
 '@ | Set-Content $konf -Encoding Default
 Inf 'SFX configuration prepared'
@@ -119,9 +120,14 @@ if (Test-Path $unrar) {
   else { Bad 'integrity test failed' }
 
   $popis = & $unrar lb $Izlaz 2>&1
-  foreach ($n in 'INSTALL.cmd', 'INSTALL.ps1', 'installers\sunshine\Luxstream-Sunshine-patched.msi') {
+  # Zakrpani sunshine.exe se dostavlja kao zasebna datoteka koju INSTALL.ps1
+  # preslika preko MSI-jevog, pa su oba dijela obavezna. MSI se prihvaca pod
+  # bilo kojim imenom (vidi fazu 3 u INSTALL.ps1), zato ga trazim po uzorku.
+  foreach ($n in 'INSTALL.cmd', 'INSTALL.ps1', 'installers\sunshine\Sunshine.exe') {
     if ($popis -contains $n) { Ok "in archive: $n" } else { Bad "MISSING: $n" }
   }
+  $msiU = @($popis | Where-Object { $_ -like 'installers\sunshine\*.msi' })
+  if ($msiU.Count -gt 0) { Ok "in archive: $($msiU[0])" } else { Bad 'MISSING: installers\sunshine\*.msi' }
 }
 
 Add-Type -AssemblyName System.Drawing

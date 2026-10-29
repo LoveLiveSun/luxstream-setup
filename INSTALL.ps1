@@ -774,6 +774,18 @@ Head '3. Sunshine (patched build)'
 $msi = Join-Path $instal 'sunshine\Luxstream-Sunshine-patched.msi'
 $sxe = 'C:\Program Files\Sunshine\Sunshine.exe'
 if (-not (Test-Path $msi)) {
+  # Prihvati i bilo koje drugo ime. Zakrpani sunshine.exe dolazi iz zasebne
+  # datoteke koja se preslikava nize, pa je i upstream MSI posve dovoljan kao
+  # osnova - nosi servis, skripte, assets, firewall i alate, a jedino sto se
+  # mijenja je sam sunshine.exe.
+  $kand = @(Get-ChildItem (Join-Path $instal 'sunshine') -Filter '*.msi' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending)
+  if ($kand.Count -gt 0) {
+    $msi = $kand[0].FullName
+    Inf "Using $($kand[0].Name) as the Sunshine base installer"
+  }
+}
+if (-not (Test-Path $msi)) {
   Bad "No $msi"
 } else {
   # Verzija se cita iz MSI baze. Prazan catch je ovdje jednom vec sakrio kvar i
@@ -820,6 +832,39 @@ if (-not (Test-Path $msi)) {
     Vrati-Prozor   # msiexec zna dovesti svoj prozor u prvi plan
     if ($p.ExitCode -eq 0 -and (Test-Path $sxe)) { Ok "Sunshine $verNova installed" }
     else { Bad "msiexec exit $($p.ExitCode) - see C:\Users\Public\luxstream-msi.log" }
+  }
+
+  # --- Luxstream: nas sunshine.exe preko MSI-jevog -------------------------
+  # MSI nosi UPSTREAM sunshine.exe. Nas build je izravna zamjena za njega: isti
+  # MinGW UCRT64 toolchain, staticki link, identicna tablica uvoza (samo
+  # api-ms-win-crt-runtime + KERNEL32). Zato ga samo preslikamo, umjesto da
+  # ponovno pakujemo MSI - za to bi trebao WiX v4 i .NET SDK, a i tada bi
+  # trebalo ponovno pogoditi sve detalje pakiranja.
+  #
+  # Ide PRIJE faze UIAccess (6), jer potpis mijenja datoteku i mora se
+  # primijeniti na konacnu verziju.
+  #
+  # Usporedba po SHA256 je i zastita od ponovnog pokretanja: instalater je
+  # idempotentan, pa drugo pokretanje ne prepisuje nista.
+  $ovl = Join-Path $instal 'sunshine\Sunshine.exe'
+  if (Test-Path $sxe) {
+    if (-not (Test-Path $ovl)) {
+      Warn "No patched binary at $ovl - keeping the one from the MSI"
+    } elseif ((Get-FileHash $ovl -Algorithm SHA256).Hash -eq (Get-FileHash $sxe -Algorithm SHA256).Hash) {
+      Ok 'Sunshine binary is already our patched build'
+    } else {
+      # Prozor mora stati - inace je datoteka zakljucana i Copy-Item pada.
+      # Vrti se i kad se MSI preskocio (verzija ista), jer se tako dostavlja
+      # novi build bez promjene verzije MSI-ja.
+      Get-Process sunshine -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 3
+      try {
+        Copy-Item $ovl $sxe -Force -ErrorAction Stop
+        Ok 'Patched sunshine.exe deployed over the one from the MSI'
+      } catch {
+        Bad "Could not replace sunshine.exe - $($_.Exception.Message)"
+      }
+    }
   }
 
   # provjera da je to doista zakrpani build
@@ -892,7 +937,7 @@ if ($resetIdentiteta) {
   }
   Ok "Old identity moved aside to $spremi"
   Inf 'Sunshine will generate a new certificate and uniqueid on start'
-  Warn 'ALL clients must be paired again (PIN via the web UI)'
+  Warn 'ALL clients must be paired again (remove the old host in Moonlight and add it back - no PIN)'
 
   # Ako klon nosi i isto ime racunala, u Moonlightu bi se pojavila dva
   # jednaka imena. Kratki sufiks iz BIOS UUID-a ih razlikuje.
@@ -1075,7 +1120,7 @@ if ($PreskociAutoPrijavu) {
   if ($wl.AutoAdminLogon -eq '1' -and $wl.DefaultUserName) {
     Ok "Automatic logon already set for $($wl.DefaultDomainName)\$($wl.DefaultUserName)"
   } elseif (Test-Path $ap) {
-    Inf 'Setting up automatic logon - it will ask for a password'
+    Inf 'Setting up automatic logon - it will ask for a password (leave it empty if the account has none)'
     & $ap | ForEach-Object { Write-Host "  $_" }
   } else {
     Warn 'No postavi-auto-prijavu.ps1 - the VM will not log on by itself and Sunshine will not start'
@@ -1182,24 +1227,24 @@ Write-Host '     -> View menu -> enable Enhanced Session.'
 Write-Host '     Plain RDP to this machine works too.'
 Write-Host '     Only then do you get keyboard and mouse back.'
 Write-Host ''
-Write-Host '  2) OPEN THE SUNSHINE WEB UI (on this VM)' -ForegroundColor Cyan
+Write-Host '  2) START MOONLIGHT (on the machine you connect from)' -ForegroundColor Cyan
+Write-Host '     If the VM is not listed, add it manually by IP address.'
+Write-Host '     Click it. Pairing now completes on its own - there is no four-digit'
+Write-Host '     PIN to carry across and nothing to confirm in the web UI.'
+Write-Host ''
+Write-Host '  3) CONNECT' -ForegroundColor Cyan
+Write-Host '     In Moonlight click the VM. Pairing is permanent - next time you'
+Write-Host '     just connect.'
+Write-Host ''
+Write-Host '  The Sunshine web UI needs no login:' -ForegroundColor Cyan
 Write-Host '       https://localhost:47990'
 Write-Host '     The browser will warn about the certificate. That is expected -'
 Write-Host '     Sunshine signs it itself. Choose Advanced, then Continue.'
-Write-Host '     If it asks for a username and password, set them now.'
-Write-Host '     That is NOT your Windows password - it is separate, for this UI.'
-Write-Host ''
-Write-Host '  3) START MOONLIGHT (on the machine you connect from)' -ForegroundColor Cyan
-Write-Host '     If the VM is not listed, add it manually by IP address.'
-Write-Host '     Click it - Moonlight shows a four-digit PIN.'
-Write-Host ''
-Write-Host '  4) ENTER THE PIN IN SUNSHINE' -ForegroundColor Cyan
-Write-Host '     In the web UI open the PIN tab, type the number and confirm.'
-Write-Host '     Sunshine confirms success and the client shows up as paired.'
-Write-Host ''
-Write-Host '  5) CONNECT' -ForegroundColor Cyan
-Write-Host '     In Moonlight click the VM. Pairing is permanent - next time you'
-Write-Host '     just connect.'
+Write-Host '     You only need it to change encoder or display settings, or to see'
+Write-Host '     which clients are paired.'
+Write-Host '     NOTE: anyone who can reach port 47990 gets in, and any Moonlight'
+Write-Host '     client using the build shipped with this setup pairs without a PIN.'
+Write-Host '     Keep this VM on an isolated network.'
 Write-Host ''
 Write-Host '  Check status at any time:'
 Write-Host '    powershell -ExecutionPolicy Bypass -File "C:\Program Files\Luxstream\scripts\brza-provjera.ps1"'

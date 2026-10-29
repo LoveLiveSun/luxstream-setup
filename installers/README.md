@@ -33,7 +33,7 @@ redistribuciju instalatera ograničavaju.
 
 | Komponenta | Odakle |
 |---|---|
-| Sunshine (zakrpani) | Releases forka `VjekoslavDugec/Sunshine-wgc` (gradi ga `build-windows-only.yml`) |
+| Sunshine (zakrpani) | `Sunshine.exe` iz naše gradnje (gradi ga `build-windows-only.yml` u forku `VjekoslavDugec/Sunshine-wgc`); MSI može biti bilo koje izdanje Sunshinea |
 | Virtual Display Driver | <https://github.com/VirtualDrivers/Virtual-Display-Driver> |
 | ViGEmBus | <https://github.com/nefarius/ViGEmBus> |
 | VB-Audio Virtual Cable | <https://vb-audio.com/Cable/> |
@@ -48,10 +48,38 @@ redistribuciju instalatera ograničavaju.
 | `vdd-driver` | uvoz potpisnika iz `.cat` → `pnputil /add-driver` → stvaranje root uređaja preko SetupAPI-ja |
 | `vigembus` | isto; hardverski ID se čita iz INF-a (`Nefarius\ViGEmBus\Gen1`) |
 | `vb-audio-cable` | `VBCABLE_Setup_x64.exe -i -h` (tiho) |
-| `sunshine` | `msiexec /qn`, ali samo ako se verzija razlikuje |
+| `sunshine` | `msiexec /qn` (ako se verzija razlikuje), pa se `Sunshine.exe` preslika preko MSI-jevog |
 
 
 Detalji i razlozi: `..\INSTALACIJA.md`.
+
+---
+
+## Sunshine: dva dijela, ne jedan
+
+U `sunshine\` su **dvije** datoteke i obje moraju biti u paketu:
+
+| Datoteka | Što je |
+|---|---|
+| `*.msi` | osnova: servis, skripte, `assets\`, firewall pravila, alati (`dxgi-info`, `audio-info`, `sunshinesvc`) |
+| `Sunshine.exe` | **naš zakrpani binarni build**, koji `INSTALL.ps1` preslika preko onoga iz MSI-ja |
+
+Zakrpa (WGC instrumentacija + WGC-only put bez Desktop Duplication probe) živi u
+**`Sunshine.exe`**, a ne u MSI-ju. Zato MSI može biti i upstream izdanje — njegov
+je `sunshine.exe` ionako zamijenjen. Ime MSI-ja nije važno: `INSTALL.ps1` uzima
+prvi `*.msi` u toj mapi ako ne nađe `Luxstream-Sunshine-patched.msi`.
+
+Zamjena je sigurna jer je naš build izravna zamjena za MSI-jev: isti MinGW UCRT64
+toolchain, statički link, identična tablica uvoza (samo `api-ms-win-crt-runtime`
+i `KERNEL32`). Prije kopiranja se `sunshine.exe` zaustavi, a usporedba po SHA256
+znači da ponovno pokretanje instalatera ne prepisuje ništa.
+
+> Zamjenu radi **faza 3**, dakle **prije** UIAccess faze (6) — potpis mijenja
+> datoteku i mora se primijeniti na konačnu verziju.
+
+Prije objave ovog paketa oba dijela treba `strip`-ati, kao što to radi
+`CPACK_STRIP_FILES` u Sunshineovom pakiranju: 121 MB → ~72 MB, uz očuvan marker
+`wgc: init start` koji instalater provjerava.
 
 ---
 

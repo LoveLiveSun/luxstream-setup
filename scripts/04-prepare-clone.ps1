@@ -93,10 +93,10 @@ Write-Host @"
 == SLJEDECI KORACI
 
 1. Provjeri da klon ima svoju IP adresu i svoj MAC (Hyper-V: novi MAC ako je dinamican).
-2. Otvori Sunshine Web UI na klonu i postavi novu lozinku:  https://<ip-klona>:47990
-3. U Moonlightu DODAJ KLON KAO NOVI HOST i upari ga ispocetka.
+2. U Moonlightu DODAJ KLON KAO NOVI HOST i klikni ga. Sparivanje ide samo od sebe,
+   bez PIN-a i bez icega u web sucelju (web sucelje nema prijavu).
    Stari zapis obrisi ako pokazuje na isti uniqueid.
-4. Pokreni .\03-verify.ps1
+3. Pokreni .\03-verify.ps1
 
 == VAZNO ZA DVIJE ISTOVREMENE SESIJE
 

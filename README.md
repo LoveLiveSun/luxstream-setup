@@ -89,9 +89,27 @@ During the install:
 - the screen briefly goes blank while the virtual display starts — expected
 - when it finishes, in Basic Session you will **see** the desktop but not be able to
   **control** it. That is the signal that it worked: the primary display is now the
-  virtual one. Switch to Enhanced Session or RDP to finish pairing.
+  virtual one. Switch to Enhanced Session or RDP so you can operate the VM and click
+  the host in Moonlight — pairing then completes on its own, with no PIN.
 
 The installer is **idempotent** — running it again skips everything already done.
+
+### Pairing and the Sunshine web UI
+
+Both sides of the pairing handshake are patched to use one fixed PIN, so **pairing is
+automatic**. Add the VM in Moonlight by IP, click it, and it pairs — there is no
+four-digit code to carry from Moonlight into the host, and no PIN dialog in Moonlight.
+Pairing is permanent; afterwards you just click and connect.
+
+> Pair only with the Moonlight build shipped alongside this setup. The stock Moonlight
+> from the stores still asks for a PIN and will not pair by itself.
+
+The Sunshine web UI (`https://<host-ip>:47990`) has **no login**. The browser will warn
+about the certificate — that is expected, Sunshine signs it itself; pick *Advanced* →
+*Continue*. You only need the UI to change encoder or display settings, or to see which
+clients are paired.
+
+> Anyone who can reach port 47990 gets straight in. Keep this VM on an isolated network.
 
 ---
 

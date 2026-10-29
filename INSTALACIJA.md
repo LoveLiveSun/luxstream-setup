@@ -153,6 +153,31 @@ Kao SYSTEM ne može aktivirati `Windows.Graphics.Capture` —
 `E_OUTOFMEMORY` iz `RoGetActivationFactory`). Zato faza 5 **onemogućuje**
 `SunshineService` i registrira zadatak `SunshineUser` koji ga vozi kao korisnika.
 
+### Sunshine: MSI je osnova, zakrpa je zasebna datoteka
+U `installers\sunshine\` su **dvije** stvari i obje moraju biti u paketu:
+
+| Datoteka | Što nosi |
+|---|---|
+| `*.msi` | servis, skripte, `assets\`, firewall pravila, alati |
+| `Sunshine.exe` | **naš zakrpani build** — WGC instrumentacija i WGC-only put |
+
+Faza 3 pusti MSI, a zatim `Sunshine.exe` **preslika** preko instaliranoga. Zato MSI
+može biti i upstream izdanje: njegov `sunshine.exe` ionako biva zamijenjen. Ime
+MSI-ja nije važno — ako nema `Luxstream-Sunshine-patched.msi`, uzima se prvi
+`*.msi` u mapi.
+
+Zamjena je sigurna jer je naš build **izravna zamjena**: isti MinGW UCRT64
+toolchain, statički link, identična tablica uvoza (samo `api-ms-win-crt-runtime`
+i `KERNEL32`). Prije kopiranja proces se zaustavi (inače je datoteka zaključana),
+a usporedba po SHA256 čini ponovno pokretanje instalatera bezopasnim.
+
+Redoslijed nije proizvoljan: zamjena ide u fazi 3, dakle **prije** UIAccess faze
+(6) — potpis mijenja datoteku, pa se mora primijeniti na konačnu verziju.
+
+`Sunshine.exe` ide u paket **stripan**. To je isti postupak koji Sunshineovo
+pakiranje radi samo (`CPACK_STRIP_FILES YES`): 121 MB → ~72 MB, a marker
+`wgc: init start`, koji instalater provjerava, ostaje netaknut.
+
 ---
 
 ## 5. Gdje paket živi
@@ -216,7 +241,8 @@ Ako klon zadrži i isto ime računala, u Moonlightu se javlja kao `IME-xxxx` (č
 znaka BIOS UUID-a), da se dva hosta razlikuju. Za ljepše ime preimenuj Windows
 računalo i pokreni instalater ponovno.
 
-**Poslije reseta se svi klijenti moraju ponovno spariti** — PIN preko web sučelja.
+**Poslije reseta se svi klijenti moraju ponovno spariti** — u Moonlightu makni stari
+host i dodaj ga ponovno. Sparivanje ide samo od sebe, bez PIN-a (vidi poglavlje 11).
 
 > Izmjereno 22.8.2026.: ako se `cacert.pem` i `cakey.pem` sklone, Sunshine pri
 > pokretanju izgenerira nove — potvrđeno drukčijim otiskom certifikata.
@@ -265,8 +291,9 @@ Paket mora raditi u oba, i radi.
 
 ### a) Svjež VM — pokreneš `INSTALL.cmd`
 
-Sve prolazi redom. Zatraži lozinku za automatsku prijavu i sparivanje s Moonlightom
-napraviš PIN-om na kraju.
+Sve prolazi redom. Zatraži lozinku za automatsku prijavu (ako račun nema lozinku,
+samo pritisni Enter). Sparivanje s Moonlightom ne treba ništa ručno — klijent se
+spari sam pri prvom kliku na host (vidi poglavlje 11).
 
 ### b) Kopiraš cijeli VM na kojem je paket već instaliran
 
@@ -301,14 +328,26 @@ lozinku i sprema je u **LSA tajne** (`LsaStorePrivateData`), ne u registry kao o
 tekst — isto kao Sysinternalsov Autologon. Ako u registryju zatekne `DefaultPassword`
 kao tekst, makne ga.
 
-Provjera bez mijenjanja: `.\postavi-auto-prijavu.ps1 -Provjeri`
+**Račun bez lozinke.** Podržan je. Na pitanje za lozinku pritisni Enter, ili dodaj
+`-PraznaLozinka` kad skriptu zoveš iz drugog skripta (nema konzole za pitanje). Tada se
+**nikakva LSA tajna ne sprema**; umjesto toga se postojeći `DefaultPassword` **obriše** —
+i iz LSA tajni i iz registryja — jer bi Winlogon inače i dalje pokušavao prijavu sa starom
+lozinkom. Uz to skripta postavi `LimitBlankPasswordUse = 0`
+(`HKLM:\SYSTEM\CurrentControlSet\Control\Lsa`), jer Windows inače **odbija** automatsku
+prijavu računa bez lozinke. `-Iskljuci` tu vrijednost vraća na zadanu `1`.
+
+Sigurnosno: račun bez lozinke znači da svatko tko dođe do konzole može ući. Prihvatljivo
+je samo na izoliranom VM-u kakav je ovaj.
+
+Provjera bez mijenjanja: `.\postavi-auto-prijavu.ps1 -Provjeri` (ispisuje i trenutni
+`LimitBlankPasswordUse`)
 
 ---
 
 ## 10. Što instalater NE radi
 
 - ne instalira Moonlight na klijent (nije ni u paketu — 42 MB koji na VM ne trebaju)
-- ne sparuje klijente — PIN se i dalje unosi ručno kroz web sučelje
+- ne sparuje klijente — to radi Moonlight sam, bez PIN-a (vidi poglavlje 11)
 - ne otvara firewall ručno (Sunshineov MSI to radi sam)
 - ne postavlja GPU-P na hostu
 - ne kopira NVIDIA driver s hosta
@@ -325,7 +364,23 @@ Na klijentu, u Moonlightu:
 | Video codec | **HEVC** | `Automatic` bi izabrao AV1 |
 | Rezolucija | jedna **iz VDD liste** | ostale se neće primijeniti |
 
-Sparivanje: otvori `https://<ip-gosta>:47990`, unesi PIN koji Moonlight pokaže.
+Sparivanje: klikni host u Moonlightu. **Ništa se ne unosi.** U ovoj postavi je
+Sunshine zakrpan tako da PIN round-trip odgovara odmah, a Moonlight da šalje isti
+fiksni PIN, pa se AES ključ na obje strane poklopi i sparivanje završi samo.
+Nema četiri znamenke koje bi prepisivao iz Moonlighta u web sučelje, niti dijaloga
+s PIN-om u Moonlightu. Sparivanje je trajno — sljedeći put samo klikneš i spojen si.
+
+> Spari se **samo** s Moonlightom iz ovog paketa. Standardni Moonlight iz trgovine
+> traži PIN i ne može se sparity bez ručnog unosa.
+
+**Web sučelje Sunshinea nema prijavu.** Otvori `https://<ip-gosta>:47990` (preglednik
+će upozoriti na certifikat — to je očekivano, Sunshine ga sam potpisuje; odaberi
+*Advanced* → *Continue*). Nema korisničkog imena ni lozinke, ni prvog postavljanja
+računa. Sučelje treba samo za promjenu enkodera ili display postavki i za popis
+sparenih klijenata.
+
+> Sigurnosno: svatko tko može doći do porta 47990 uđe bez ikakve provjere. Zato VM
+> drži na izoliranoj mreži.
 
 Provjera da je sve preživjelo restart: `C:\Users\Public\boot-verify.txt`, koji zadatak
 `VerifyAfterBoot` zapiše 100 s nakon prijave.
