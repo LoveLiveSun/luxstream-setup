@@ -3,6 +3,10 @@
 
 dd_configuration_option = ensure_only_display
 dd_resolution_option = auto
+# Gornja granica u kbps, ne ciljna vrijednost. Sunshine enkodira onoliko koliko
+# Moonlight zatrazi, a ovime se to reze na najvise 500000 (500 Mbps) - sto je i
+# maksimum Moonlightovog klizaca kad je ukljucen "Unlock bitrate".
+max_bitrate = 500000
 output_name = {POPUNITI-SKRIPTOM}
 encoder = software
 sw_preset = superfast

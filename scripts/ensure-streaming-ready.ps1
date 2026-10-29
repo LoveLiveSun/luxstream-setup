@@ -208,15 +208,35 @@ function Deaktiviraj($ime) {
 function Tece-Stream {
   # NVENC sesija > 0 znaci da netko upravo strema. Dok stream tece NE SMIJEMO
   # dirati topologiju - priming bi korisniku srusio rezoluciju usred rada.
-  # nvidia-smi u gostu radi djelomicno: baci gresku za device handle fizickog
-  # GPU-a, ali --query-gpu prode.
+  #
+  # nvidia-smi u GPU-P gostu NIJE pouzdan. Izmjereno 29.10.2026. na gostu
+  # DESKTOP-QRT4CQP: vrati
+  #   "Unable to determine the device handle for GPU0: ... Unknown Error"
+  #   "No devices were found"
+  # pa petlja nize ne nadje nijedan broj. Stara verzija je tada vracala $false,
+  # dakle "stream ne tece" - i to TRAJNO. Ovako slijepa funkcija ne smije biti
+  # brana ni za sto.
+  #
+  # Pravilo: nvidia-smi se vjeruje SAMO ako je stvarno dao broj.
+  #   dao broj > 0           -> stream tece, ne diraj
+  #   dao broj = 0           -> stream ne tece
+  #   nije dao broj (greska) -> pitaj TCP: spojen klijent = racunaj da tece
+  #
+  # Rezerva je NAMJERNO konzervativna - bolje propustiti jedan priming nego
+  # srusiti rezoluciju covjeku koji upravo igra. Vidi Klijent-Spojen.
   $smi = 'C:\Windows\System32\nvidia-smi.exe'
-  if (-not (Test-Path $smi)) { return $false }
-  $izlaz = & $smi --query-gpu=encoder.stats.sessionCount --format=csv,noheader 2>$null
-  foreach ($red in @($izlaz)) {
-    if ("$red" -match '(\d+)' -and [int]$Matches[1] -gt 0) { return $true }
+  $smiOdgovorio = $false
+  if (Test-Path $smi) {
+    $izlaz = & $smi --query-gpu=encoder.stats.sessionCount --format=csv,noheader 2>$null
+    foreach ($red in @($izlaz)) {
+      if ("$red" -match '(\d+)') {
+        $smiOdgovorio = $true
+        if ([int]$Matches[1] -gt 0) { return $true }
+      }
+    }
   }
-  return $false
+  if ($smiOdgovorio) { return $false }
+  return (Klijent-Spojen)
 }
 
 function Klijent-Spojen {

@@ -77,7 +77,8 @@ if ($null -ne $dpi) { Ok "DpiValue (relativno od preporucenog): $($dpi -join ', 
 Write-Host ''
 if ($script:fail -eq 0) {
   Write-Host '== SVE PROVJERE PROSLE. Spoji se Moonlightom.' -ForegroundColor Green
-  Write-Host '   Ne zaboravi u klijentu: Optimize game settings = ukljuceno, bitrate 50-80 Mbps.'
+  Write-Host '   Ne zaboravi u klijentu: Optimize game settings = ukljuceno.'
+  Write-Host '   Bitrate: ukljuci "Unlock bitrate" pa postavi 500 Mbps (500000 kbps).'
   exit 0
 } else {
   Write-Host "== $($script:fail) PROVJERA NIJE PROSLA. Vidi tablicu simptoma u README.md" -ForegroundColor Red

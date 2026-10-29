@@ -1001,10 +1001,19 @@ for ($pokusaj = 1; $pokusaj -le 3 -and -not $guid; $pokusaj++) {
 }
 }
 
+# max_bitrate je GORNJA GRANICA u kbps, ne ciljna vrijednost. Sunshine uvijek
+# enkodira onoliko koliko MOONLIGHT zatrazi (x-ml-video.configuredBitrateKbps),
+# a ova se brojka primjenjuje kao zadnji rezač: min(klijent, max_bitrate).
+# Postavlja se na 500000 (500 Mbps) jer je to i gornja granica Moonlightovog
+# klizaca kad je ukljucen "Unlock bitrate" - dakle 500 Mbps je najvise sto se
+# u ovom lancu moze postici. 0 bi znacilo "bez granice".
+# Napomena: 500 Mbps se NE dobiva samo ovime - klijent to mora zatraziti.
+# Vidi korak "Video bitrate" u kontrolnoj listi na kraju.
 $redci = @(
   'capture = wgc'
   'dd_configuration_option = verify_only'
   'dd_resolution_option = auto'
+  'max_bitrate = 500000'
   'min_log_level = info'
   "sunshine_name = $env:COMPUTERNAME$sufiksImena"
 )
@@ -1288,6 +1297,11 @@ Write-Host '  Check these on the CLIENT (Moonlight). Not changes - a checklist:'
 Write-Host '    Video decoder : must be Automatic, i.e. hardware decoding.'
 Write-Host '                    With Force software decoding, decode jumps from ~1.5 ms to ~190 ms.'
 Write-Host '    Video codec   : HEVC. With Automatic the client would pick AV1.'
+Write-Host '    Video bitrate : tick "Unlock bitrate", then set the slider to 500 Mbps.'
+Write-Host '                    The slider stops at 150 Mbps until that box is ticked;'
+Write-Host '                    500 Mbps is its maximum with it on. Sunshine allows the'
+Write-Host '                    same ceiling (max_bitrate = 500000 kbps in sunshine.conf).'
+Write-Host '                    Wired LAN only - this is ~500 Mbit/s of real traffic.'
 Write-Host '    Resolution    : any from the VDD list; a mode not in the list is silently ignored.'
 Write-Host ''
 Write-Host "  Install log: $dnevnik"
