@@ -3,11 +3,13 @@
 **Ne trebaš ovo čitati za normalno postavljanje.** Sve što je ovdje opisano radi
 `INSTALL.cmd` iz korijena paketa. Ovaj dokument postoji zbog dvije stvari: da se zna
 **točno koje verzije** su provjerene u radu, i da se paket može **rekonstruirati** bez
-ovih binarnih datoteka (za objavu na GitHubu — vidi `DISTRIBUCIJA.md`).
+ovih binarnih datoteka (za objavu na GitHubu — vidi `DISTRIBUCIJA.md`, internu
+bilješku koja nije u ovom repozitoriju).
 
-> Stara verzija ovog dokumenta je u `README.md.zastarjelo`. Bila je netočna na dvije
-> važne stavke: uputila je da se Sunshine instalira **kao servis** (ne može — SYSTEM ne
-> može aktivirati WGC) i navodila je staru upstream verziju Sunshinea bez naših zakrpa.
+> Stara verzija ovog dokumenta (`README.md.zastarjelo`, lokalna arhiva koja nije u
+> repozitoriju) bila je netočna na dvije važne stavke: uputila je da se Sunshine
+> instalira **kao servis** (ne može — SYSTEM ne može aktivirati WGC) i navodila je
+> staru upstream verziju Sunshinea bez naših zakrpa.
 
 ---
 

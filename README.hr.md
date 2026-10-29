@@ -48,7 +48,7 @@ Fork: `VjekoslavDugec/Sunshine-wgc`. Postupak je u **[FORK.md](FORK.md)**.
 
 **Prethodna arhitektura je napuštena.** VDD se više ne veže na WARP nego na
 `NVIDIA GeForce RTX 4090`, a enkodiranje više ne ide na CPU. Stara verzija ovog
-dokumenta je u `README.md.zastarjelo`.
+dokumenta je u `README.md.zastarjelo` (lokalna arhiva koja nije u repozitoriju).
 
 Trenutna radna postava s točnim postavkama oba kraja: **[RADNA-POSTAVA.md](RADNA-POSTAVA.md)**.
 Grafika: **[GRAFIKA.md](GRAFIKA.md)**. Otvorene stavke: **[TODO.md](TODO.md)**.
@@ -215,7 +215,7 @@ Jedini uvjet je da **Hyper-V synthetic display bude prikačen na desktop** — b
 NVIDIA-in ICD nabroji nula uređaja, a OpenGL padne na `GDI Generic 1.1`.
 
 Cijela priča, s objašnjenjem zašto je tako i što se sve pokazalo krivim, je u
-**[GRAFIKA.md](GRAFIKA.md)**. Stara verzija ovog poglavlja je u `README.md.zastarjelo`.
+**[GRAFIKA.md](GRAFIKA.md)**. Stara verzija ovog poglavlja je u `README.md.zastarjelo` (lokalna arhiva koja nije u repozitoriju).
 
 ## 5. Postavke Moonlight klijenta
 

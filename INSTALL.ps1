@@ -474,16 +474,6 @@ function Hwid-IzInf([string]$inf) {
   return $null
 }
 
-function Instaliraj-Driver([string]$inf, [string]$naziv, [string]$hwid) {
-  if (-not (Test-Path $inf)) { Warn "$naziv - INF does not exist: $inf"; return }
-  $vec = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
-         Where-Object { $_.InstanceId -like "*$hwid*" -and $_.Status -eq 'OK' }
-  if ($vec) { Ok "$naziv is already installed"; return }
-  Inf "$naziv - adding driver to the store"
-  $r = & "$sys\pnputil.exe" /add-driver $inf /install 2>&1
-  if ($r -match 'success|uspj') { Ok "$naziv - driver added" } else { Warn "$naziv - pnputil: $($r -join ' ')" }
-}
-
 # VDD i ViGEmBus su root-enumerirani: driver u trgovini nije dovoljan, treba
 # stvoriti i sam uredaj. Radi se preko SetupAPI-ja, bez vanjskih alata.
 $devSig = @'
@@ -697,9 +687,6 @@ Write-Host ''
 if (Test-Path $vddXml) { Copy-Item $vddXml "$vddXml.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')" -Force -ErrorAction SilentlyContinue }
 
 $zapisano = Zapisi-BezBom $vddXml $xml
-if (-not $zapisano) {
-  # Ako ni ugasen driver nije pomogao, ostala je jos ACL prepreka. Preuzmi
-}
 
 if ($zapisano) {
   # Ne vjeruj na rijec - procitaj natrag i provjeri da je NASA konfiguracija.
@@ -710,6 +697,7 @@ if ($zapisano) {
     Bad 'vdd_settings.xml was written but the contents do not match - check manually'
   }
 } else {
+  # Ako ni ugasen driver nije pomogao, ostala je ACL prepreka - preuzmi vlasnistvo nad datotekom.
   Bad "$vddXml was NOT written - the VDD will run with DEFAULT settings"
   Inf 'Meaning: not bound to the NVIDIA GPU and without our resolution list.'
 }

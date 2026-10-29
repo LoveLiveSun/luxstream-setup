@@ -4,7 +4,7 @@
 
 Prethodna verzija ovog dokumenta tvrdila je da izvorni Vulkan i OpenGL ne rade i da
 treba Mesa. **To je bilo krivo** i cijeli je dokument zato prepisan. Stara verzija je
-zadržana kao `GRAFIKA.md.zastarjelo`.
+zadržana kao `GRAFIKA.md.zastarjelo` (lokalna arhiva koja nije u repozitoriju).
 
 ---
 
