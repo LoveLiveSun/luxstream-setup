@@ -121,6 +121,9 @@ When it finishes, the Hyper-V display becomes secondary, so in Basic Session
 you will see the desktop but will not be able to control it. That is your
 signal to switch to Enhanced Session or RDP so you can operate the VM and click
 the host in Moonlight - pairing completes on its own, with no PIN.
+
+To remove everything again later: Start Menu -> "Uninstall Luxstream", or
+C:\Program Files\Luxstream\Luxstream-ODINSTALIRAJ.cmd (-Samoprovjera to preview).
 }
 '@ | Set-Content $konf -Encoding Default
 Inf 'SFX configuration prepared'
@@ -173,7 +176,13 @@ if (Test-Path $unrar) {
   # Zakrpani sunshine.exe se dostavlja kao zasebna datoteka koju INSTALL.ps1
   # preslika preko MSI-jevog, pa su oba dijela obavezna. MSI se prihvaca pod
   # bilo kojim imenom (vidi fazu 3 u INSTALL.ps1), zato ga trazim po uzorku.
-  foreach ($n in 'INSTALL.cmd', 'INSTALL.ps1', 'installers\sunshine\Sunshine.exe') {
+  #
+  # Deinstalater je OBAVEZAN dio isporuke: INSTALL.ps1 ga preslika u
+  # C:\Program Files\Luxstream i prema njemu napravi precac u Start izborniku.
+  # Bez njega u paketu korisnik ostane bez nacina da ovo sve ukloni, pa se
+  # build ovdje prekida umjesto da se tiho isporuci nepotpun instalater.
+  foreach ($n in 'INSTALL.cmd', 'INSTALL.ps1', 'UNINSTALL.ps1', 'Luxstream-ODINSTALIRAJ.cmd',
+                 'installers\sunshine\Sunshine.exe') {
     if ($popis -contains $n) { Ok "in archive: $n" } else { Bad "MISSING: $n" }
   }
   $msiU = @($popis | Where-Object { $_ -like 'installers\sunshine\*.msi' })

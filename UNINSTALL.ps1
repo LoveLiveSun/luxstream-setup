@@ -28,6 +28,7 @@
         gamepad   ViGEmBus (vigembus.inf)
         registar  UAC, automatska prijava, GameDVR/Game Bar, DPI
         vatrozid  pravila "Luxstream *", ako postoje
+        precac    Start izbornik -> "Uninstall Luxstream"
         datoteke  C:\Program Files\Luxstream, C:\Luxstream-setup,
                   C:\Users\Public\sunshine-gpup-setup, C:\Users\Public\Luxstream.exe,
                   %USERPROFILE%\Luxstream, C:\Users\Public\luxstream-*
@@ -545,6 +546,15 @@ foreach ($r in $pravila) {
 # ======================================================= 11. DATOTEKE =======
 Head '11. Files and leftovers'
 foreach ($p in $programMape) { Obrisi-Mapu $p }
+
+# Precac u Start izborniku koji INSTALL napravi (za sve korisnike)
+$precacMapa = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Luxstream'
+Obrisi-Datoteku (Join-Path $precacMapa 'Uninstall Luxstream.lnk')
+if (Test-Path $precacMapa) {
+  $ostalo = @(Get-ChildItem $precacMapa -Force -ErrorAction SilentlyContinue)
+  if ($ostalo.Count -eq 0) { Obrisi-Mapu $precacMapa }
+  else { Inf "ostavljam $precacMapa - sadrzi i: $((@($ostalo | ForEach-Object { $_.Name }) -join ', '))" }
+}
 
 Obrisi-Datoteku 'C:\Users\Public\Luxstream.exe'
 

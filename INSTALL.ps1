@@ -440,6 +440,45 @@ if ($korijen -eq $dom) {
   }
 }
 
+# --- deinstalater mora zavrsiti u $dom ----------------------------------------
+# Korisnik ga tamo trazi, pa se ne oslanjam na to da ce ga robocopy pokupiti kao
+# i svaku drugu datoteku iz korijena paketa: ako se popis izuzetaka (/XF, /XD)
+# ikad promijeni, ovdje se to odmah vidi umjesto da paket tiho izade bez njega.
+$deinstalater = Join-Path $dom 'Luxstream-ODINSTALIRAJ.cmd'
+foreach ($n in 'UNINSTALL.ps1', 'Luxstream-ODINSTALIRAJ.cmd') {
+  $u = Join-Path $dom $n
+  if (Test-Path $u) { Ok "uninstaller in place: $u"; continue }
+  $iz = Join-Path $korijen $n
+  if (Test-Path $iz) {
+    Copy-Item $iz $u -Force
+    Ok "uninstaller copied: $u"
+  } else {
+    Warn "paket ne sadrzi $n - deinstalater nece biti u $dom"
+  }
+}
+
+# --- precac u Start izborniku (za sve korisnike) -------------------------------
+# Da se deinstalater ne mora traziti po disku. Precac gleda na .cmd omotac, ne
+# na .ps1: dvoklik na .ps1 otvara editor umjesto da ga pokrene.
+if (Test-Path $deinstalater) {
+  try {
+    $precacMapa = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Luxstream'
+    New-Item -ItemType Directory -Path $precacMapa -Force | Out-Null
+    $precac = Join-Path $precacMapa 'Uninstall Luxstream.lnk'
+    $ws = New-Object -ComObject WScript.Shell
+    $lnk = $ws.CreateShortcut($precac)
+    $lnk.TargetPath       = $deinstalater
+    $lnk.WorkingDirectory = $dom
+    $lnk.Description      = 'Remove Luxstream and everything it installed'
+    $ikona = Join-Path $dom 'host\Luxstream.ico'
+    if (Test-Path $ikona) { $lnk.IconLocation = "$ikona,0" }
+    $lnk.Save()
+    Ok "Start Menu shortcut: $precac"
+  } catch {
+    Warn "Start Menu shortcut: $($_.Exception.Message)"
+  }
+}
+
 # Od sada sve ide iz ugradene kopije, da zadaci ne ovise o tome odakle si pokrenuo.
 $skripte = Join-Path $dom 'scripts'
 if (Test-Path (Join-Path $dom 'installers')) { $instal = Join-Path $dom 'installers' }
@@ -1378,6 +1417,25 @@ Write-Host '                    same ceiling (max_bitrate = 500000 kbps in sunsh
 Write-Host '                    Wired LAN only - this is ~500 Mbit/s of real traffic.'
 Write-Host '    Resolution    : any from the VDD list; a mode not in the list is silently ignored.'
 Write-Host ''
+Write-Host '  ============================================================' -ForegroundColor Yellow
+Write-Host '  HOW TO REMOVE ALL OF THIS' -ForegroundColor Cyan
+Write-Host '    Start Menu  ->  Uninstall Luxstream'
+Write-Host '    or          ->  C:\Program Files\Luxstream\Luxstream-ODINSTALIRAJ.cmd'
+Write-Host ''
+Write-Host '    See what it would do first - lists everything, changes nothing:'
+Write-Host '      Luxstream-ODINSTALIRAJ.cmd -Samoprovjera'
+Write-Host ''
+Write-Host '    It unregisters the scheduled tasks, removes Sunshine, the VDD,'
+Write-Host '    ViGEmBus and the VB-Audio cable, reverts the registry changes'
+Write-Host '    (UAC, automatic logon, GameDVR, DPI), drops the firewall rule and'
+Write-Host '    deletes the package. A restart is required at the end.'
+Write-Host ''
+Write-Host '    Bridge data and sunshine.conf are MOVED to'
+Write-Host '    C:\Luxstream-uklonjeno-<timestamp>, never deleted - unless you'
+Write-Host '    pass -Obrisi explicitly. The signing certificates are left in'
+Write-Host '    place unless you pass -ObrisiCertifikate (SignPath is a public CA).'
+Write-Host ''
+Write-Host '  ============================================================' -ForegroundColor Yellow
 Write-Host "  Install log: $dnevnik"
 Write-Host '  Documentation: README.md, RADNA-POSTAVA.md, GRAFIKA.md, TODO.md'
 Write-Host ''

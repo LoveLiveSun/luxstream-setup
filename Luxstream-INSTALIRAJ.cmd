@@ -61,4 +61,9 @@ echo.
 echo   Install finished. The package remains in %CILJ%
 echo   You can run it again from there, without the network.
 echo.
+echo   To remove everything again later:
+echo     - Start Menu  ^>  Uninstall Luxstream
+echo     - or run    %CILJ%\Luxstream-ODINSTALIRAJ.cmd
+echo   Add -Samoprovjera to just see what it would remove.
+echo.
 pause
