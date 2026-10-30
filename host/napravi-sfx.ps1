@@ -182,7 +182,7 @@ if (Test-Path $unrar) {
   # Bez njega u paketu korisnik ostane bez nacina da ovo sve ukloni, pa se
   # build ovdje prekida umjesto da se tiho isporuci nepotpun instalater.
   foreach ($n in 'INSTALL.cmd', 'INSTALL.ps1', 'UNINSTALL.ps1', 'Luxstream-ODINSTALIRAJ.cmd',
-                 'installers\sunshine\Sunshine.exe') {
+                 'UNINSTALL.cmd', 'installers\sunshine\Sunshine.exe') {
     if ($popis -contains $n) { Ok "in archive: $n" } else { Bad "MISSING: $n" }
   }
   $msiU = @($popis | Where-Object { $_ -like 'installers\sunshine\*.msi' })

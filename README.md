@@ -114,6 +114,68 @@ clients are paired.
 
 ---
 
+## Uninstall
+
+`UNINSTALL.ps1` ships inside the package and the installer puts it where you can
+find it:
+
+- **Start Menu → Uninstall Luxstream**, or
+- `C:\Program Files\Luxstream\UNINSTALL.cmd`, or
+- `C:\Program Files\Luxstream\Luxstream-ODINSTALIRAJ.cmd` (same thing)
+
+Double-click any of them. They ask for administrator rights and work through 11
+phases. Both `.cmd` names are deliberate: the installer has `INSTALL.cmd` next to
+`Luxstream-INSTALIRAJ.cmd`, so the uninstaller has the same pair.
+
+**Preview first** — lists everything it would remove, changes nothing:
+
+```powershell
+C:\Program Files\Luxstream\UNINSTALL.cmd -Samoprovjera
+```
+
+### What it removes
+
+| Phase | |
+|---|---|
+| 1 | the five scheduled tasks — **first**, before files or drivers |
+| 2 | running processes |
+| 3 | bridge data (`bridge.json`, `%USERPROFILE%\Luxstream`) |
+| 4 | VB-Audio virtual cable |
+| 5 | Sunshine (MSI + `C:\Program Files\Sunshine`) |
+| 6–7 | the VDD (`mttvdd.inf`) and ViGEmBus (`vigembus.inf`) |
+| 8 | imported signing certificates — **only with `-ObrisiCertifikate`** |
+| 9 | registry: UAC, automatic logon, GameDVR/Game Bar, DPI |
+| 10 | the `Luxstream*` firewall rule, if one exists |
+| 11 | files, the Start Menu shortcut, and the package itself |
+
+A **restart is required** afterwards — drivers were removed and the display
+topology was reverted.
+
+### Nothing of yours is deleted by default
+
+Bridge data and `sunshine.conf` (which carries the pairing certificates and
+`uniqueid`) are **moved** to `C:\Luxstream-uklonjeno-<timestamp>`, so the setup can
+be put back without re-pairing everything. Pass `-Obrisi` to delete them outright.
+
+The signing certificates are left in place unless you pass `-ObrisiCertifikate`.
+SignPath Foundation is a **public** CA — removing it from `Root` affects any other
+software signed with it.
+
+| Flag | |
+|---|---|
+| `-Samoprovjera` | dry run: full listing, no changes |
+| `-Obrisi` | delete the quarantined data instead of moving it |
+| `-ZadrziDrivere` | keep the VDD, ViGEmBus and the VB-Audio cable |
+| `-ZadrziSunshine` | keep Sunshine |
+| `-ObrisiCertifikate` | also remove the imported signers (see the warning above) |
+| `-Prisili` | skip the confirmation prompt |
+| `-Tiho` | quieter output |
+
+The installer is idempotent and so is the uninstaller — running it twice on a
+system that is already clean just prints `nema` ("not there") for each step.
+
+---
+
 ## What it configures
 
 | Phase | |

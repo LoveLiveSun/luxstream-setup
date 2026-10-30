@@ -217,6 +217,37 @@ NVIDIA-in ICD nabroji nula uređaja, a OpenGL padne na `GDI Generic 1.1`.
 Cijela priča, s objašnjenjem zašto je tako i što se sve pokazalo krivim, je u
 **[GRAFIKA.md](GRAFIKA.md)**. Stara verzija ovog poglavlja je u `README.md.zastarjelo` (lokalna arhiva koja nije u repozitoriju).
 
+## 4a. Uklanjanje
+
+`UNINSTALL.ps1` je dio paketa i instalater ga ostavi na mjestu gdje ga možeš naći:
+
+- **Start izbornik → Uninstall Luxstream**, ili
+- `C:\Program Files\Luxstream\UNINSTALL.cmd`, ili
+- `C:\Program Files\Luxstream\Luxstream-ODINSTALIRAJ.cmd` (isto)
+
+Dvoklik je dovoljan — sam traži administratorske ovlasti.
+
+**Prvo pogledaj što bi napravio** (ispiše sve, ne mijenja ništa):
+
+```powershell
+C:\Program Files\Luxstream\UNINSTALL.cmd -Samoprovjera
+```
+
+Uklanja svih **pet** zakazanih zadataka (`SunshineUser`, `StreamReady`,
+`RestoreConsoleSession`, `VerifyAfterBoot`, `LuxstreamBridge`), Sunshine, VDD,
+ViGEmBus i VB-Audio kabel, vraća registry izmjene (UAC, automatska prijava,
+GameDVR/Game Bar, DPI), skida firewall pravilo i obriše paket. Na kraju je
+**obavezan restart**.
+
+Zadaci se odjavljuju **prije** drivera i datoteka — obrnut redoslijed ne radi jer
+`StreamReady` i `SunshineUser` u međuvremenu ponovno podignu Sunshine.
+
+Podaci mosta i `sunshine.conf` se **premjeste** u `C:\Luxstream-uklonjeno-<vrijeme>`,
+a ne brišu; trajno brisanje je `-Obrisi`. Potpisnički certifikati se ne diraju bez
+`-ObrisiCertifikate` (SignPath Foundation je javni CA).
+
+Puni popis faza i prekidača je u **[INSTALACIJA.md](INSTALACIJA.md)**, poglavlje 12.
+
 ## 5. Postavke Moonlight klijenta
 
 | Postavka | Vrijednost | Zašto |
@@ -515,6 +546,12 @@ Postava mora ostati na **GPU-P** — host ne smije ostati bez GPU-a. Unutar tog 
 ## 9. Sadržaj paketa
 
 ```
+INSTALL.cmd                      pokretač instalacije (dvoklik, sam traži ovlasti)
+INSTALL.ps1                      glavni instalater
+UNINSTALL.ps1                    glavni deinstalater (vidi poglavlje 12 u INSTALACIJA.md)
+UNINSTALL.cmd                    pokretač uklanjanja (dvoklik, sam traži ovlasti)
+Luxstream-ODINSTALIRAJ.cmd       isto, hrvatsko ime - par uz INSTALL.cmd
+Luxstream-INSTALIRAJ.cmd         instalacija s mrežnog mjesta - kopira paket lokalno
 README.md                        ovaj dokument
 config/
   vdd_settings.xml               provjerena VDD konfiguracija

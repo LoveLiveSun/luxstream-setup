@@ -445,7 +445,7 @@ if ($korijen -eq $dom) {
 # i svaku drugu datoteku iz korijena paketa: ako se popis izuzetaka (/XF, /XD)
 # ikad promijeni, ovdje se to odmah vidi umjesto da paket tiho izade bez njega.
 $deinstalater = Join-Path $dom 'Luxstream-ODINSTALIRAJ.cmd'
-foreach ($n in 'UNINSTALL.ps1', 'Luxstream-ODINSTALIRAJ.cmd') {
+foreach ($n in 'UNINSTALL.ps1', 'Luxstream-ODINSTALIRAJ.cmd', 'UNINSTALL.cmd') {
   $u = Join-Path $dom $n
   if (Test-Path $u) { Ok "uninstaller in place: $u"; continue }
   $iz = Join-Path $korijen $n

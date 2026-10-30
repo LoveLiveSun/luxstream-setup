@@ -23,6 +23,9 @@ To je sve. `INSTALL.cmd` sam traži administratorske ovlasti i pokreće `INSTALL
 
 > `.ps1` se dvoklikom ne pokreće nego otvara u editoru — zato omotač u `.cmd`.
 
+Za uklanjanje svega postoji simetričan `Luxstream-ODINSTALIRAJ.cmd`, kojeg
+instalater ostavi u paketu (vidi poglavlje 12).
+
 Ručno, iz **povišenog** PowerShella:
 
 ```powershell
@@ -70,7 +73,7 @@ Sve troje preflight provjerava i, ako što nedostaje, staje prije nego bilo što
 | 2 | VDD konfiguracija | vezanje na GPU + lista modova, restart drivera, provjera da monitor postoji |
 | 3 | Sunshine | instalacija zakrpanog builda + provjera da build doista sadrži zakrpe |
 | 4 | Sunshine config | otkrivanje GUID-a VDD displaya iz loga, pisanje `sunshine.conf` |
-| 5 | zadaci | `SunshineUser`, `StreamReady`, `RestoreConsoleSession`, `VerifyAfterBoot` |
+| 5 | zadaci | `SunshineUser`, `StreamReady`, `RestoreConsoleSession`, `VerifyAfterBoot`, `LuxstreamBridge` |
 | 6 | prilagodbe | DPI 100 %, Game Bar, **UIAccess**, **automatska prijava**, UAC |
 | 7 | priming i provjera | priming grafike, mjerenje (Hyper-V display **ostaje** aktivan) |
 
@@ -384,3 +387,78 @@ sparenih klijenata.
 
 Provjera da je sve preživjelo restart: `C:\Users\Public\boot-verify.txt`, koji zadatak
 `VerifyAfterBoot` zapiše 100 s nakon prijave.
+
+---
+
+## 12. Uklanjanje
+
+`UNINSTALL.ps1` je dio paketa i instalater ga ostavi tamo gdje ga možeš naći:
+
+- **Start izbornik → Uninstall Luxstream**, ili
+- `C:\Program Files\Luxstream\UNINSTALL.cmd`, ili
+- `C:\Program Files\Luxstream\Luxstream-ODINSTALIRAJ.cmd` (isto)
+
+Dvoklik na bilo koje. Zatraži administratorske ovlasti i prođe kroz 11 faza. Dva
+`.cmd` imena su namjerna: instalater ima `INSTALL.cmd` uz
+`Luxstream-INSTALIRAJ.cmd`, pa deinstalater ima isti par.
+
+**Prvo pogledaj što bi napravio** — ispiše sve, ne mijenja ništa:
+
+```powershell
+C:\Program Files\Luxstream\UNINSTALL.cmd -Samoprovjera
+```
+
+### Prekidači
+
+| Prekidač | Što radi |
+|---|---|
+| `-Samoprovjera` | samo popis, nijedna promjena |
+| `-Obrisi` | podatke u karanteni briše trajno umjesto da ih premjesti |
+| `-ZadrziDrivere` | ne dira VDD, ViGEmBus ni VB-Audio kabel |
+| `-ZadrziSunshine` | ne uklanja Sunshine |
+| `-ObrisiCertifikate` | uklanja i uvezene potpisnike — vidi upozorenje niže |
+| `-Prisili` | bez potvrde |
+| `-Tiho` | manje ispisa |
+
+### Redoslijed faza
+
+| # | Faza |
+|---|---|
+| 1 | pet zakazanih zadataka — **prvo**, prije datoteka i drivera |
+| 2 | pokrenuti procesi |
+| 3 | podaci mosta (`bridge.json`, `%USERPROFILE%\Luxstream`) |
+| 4 | VB-Audio kabel |
+| 5 | Sunshine (MSI + `C:\Program Files\Sunshine`) |
+| 6–7 | VDD (`mttvdd.inf`) i ViGEmBus (`vigembus.inf`) |
+| 8 | uvezeni potpisnici — **samo uz `-ObrisiCertifikate`** |
+| 9 | registry: UAC, automatska prijava, GameDVR/Game Bar, DPI |
+| 10 | firewall pravilo `Luxstream*`, ako postoji |
+| 11 | datoteke, prečac u Start izborniku i sam paket |
+
+Zadaci se odjavljuju **prije** drivera i datoteka. Obrnut redoslijed ne radi:
+`StreamReady` i `SunshineUser` okidaju pri prijavi i u međuvremenu **ponovno
+podignu Sunshine**, pa se vraća ono što je upravo uklonjeno.
+
+Na kraju je **obavezan restart** — uklonjeni su driveri i vraćena je topologija
+displaya.
+
+### Ništa tvoje se ne briše samo od sebe
+
+Podaci mosta i `sunshine.conf` (koji nosi certifikate za sparivanje i `uniqueid`)
+se **premjeste** u `C:\Luxstream-uklonjeno-<vrijeme>`, pa se postava može vratiti
+bez ponovnog sparivanja svih klijenata. Trajno brisanje je `-Obrisi`.
+
+Potpisnici drivera se **ne diraju** bez `-ObrisiCertifikate`. SignPath Foundation
+je **javni** CA — njegovo uklanjanje iz `Root` utječe i na drugi softver potpisan
+tim certifikatom.
+
+I deinstalater je idempotentan kao i instalater: na sustavu bez Luxstreama samo
+ispiše „nema" za svaki korak.
+
+### Što se ne može vratiti skriptom
+
+| Što | Zašto |
+|---|---|
+| LSA tajna `DefaultPassword` | skripta je ne može obrisati; bez `AutoAdminLogon = 1` više se ne koristi, ali ostaje u spremištu |
+| `C:\Program Files\VB\CABLE` | vlastiti deinstalater VB-Audio ga ne obriše uvijek — ako je kabel došao s Luxstreamom, obriši mapu ručno |
+| zapisi u `pnputil` spremištu | uklanjaju se, ali povratak znači ponovnu instalaciju drivera |
