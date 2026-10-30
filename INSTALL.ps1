@@ -1150,9 +1150,14 @@ Ok 'Task VerifyAfterBoot registered'
 # protokola streama - pa radi s bilo kojom verzijom Sunshinea i Moonlighta.
 #
 # U ovom VM-u je KLIJENT, tj. strana koja se SPAJA. Razlog je adresa: host na
-# Default Switchu ima fiksnu 172.29.32.1, a adresa VM-a se mijenja (DHCP i
+# Default Switchu ima fiksnu adresu, a adresa VM-a se mijenja (DHCP i
 # klonovi), pa bi se na hostu stalno morala prepisivati. Klijent bez -Peer
 # sam uzme zadani gateway, a to je na Default Switchu upravo host.
+#
+# Adresa samog Default Switcha se NE zna ovdje: nije ista na svakom stroju
+# (172.29.32.1 je cest, 172.21.80.1 jednako tako). Zato se u zavrsnom ispisu ne
+# navodi tvrda mreza za vatrozid - pravu ispise most na hostu, koji ju procita
+# sam. Vidi Nadji-Switch u luxstream-bridge.ps1.
 #
 # Druga polovica (na HOSTU) se pokrece rucno - vidi zavrsni ispis.
 $skriptaMost = Join-Path $skripte 'luxstream-bridge.ps1'
@@ -1372,8 +1377,17 @@ if ($mostTajna) {
   Write-Host '       & ''C:\Program Files\Luxstream\scripts\luxstream-bridge.ps1'' -Mode Server -Install'
 }
 Write-Host ''
-Write-Host '     and open the port on the host (once, also elevated):'
-Write-Host '       New-NetFirewallRule -DisplayName "Luxstream bridge" -Direction Inbound -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress 172.29.32.0/24'
+Write-Host '     If registering the Host half reports access denied, the script was'
+Write-Host '     not elevated - the task is NOT registered and the bridge will not'
+Write-Host '     start by itself. Run it again from an elevated PowerShell.'
+Write-Host ''
+Write-Host '     The port must be open on the host too. Do NOT copy a subnet from'
+Write-Host '     here: the Default Switch address is not the same on every machine.'
+Write-Host '     -Install on the host prints the exact command, with the subnet it'
+Write-Host '     detected. Use that line, or add -DopustiVatru to have it open the'
+Write-Host '     port itself. The command looks like this:'
+Write-Host ''
+Write-Host '       New-NetFirewallRule -DisplayName "Luxstream bridge" -Direction Inbound -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress <subnet-printed-by-Install>'
 Write-Host ''
 Write-Host '     The same script must exist on the host. If you only unpacked this'
 Write-Host '     package in the VM, copy scripts\luxstream-bridge.ps1 to the host'

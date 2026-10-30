@@ -354,6 +354,8 @@ Provjera bez mijenjanja: `.\postavi-auto-prijavu.ps1 -Provjeri` (ispisuje i tren
 - ne otvara firewall ručno (Sunshineov MSI to radi sam)
 - ne postavlja GPU-P na hostu
 - ne kopira NVIDIA driver s hosta
+- **ne postavlja drugu polovicu mosta na hostu** — u VM-u registrira samo klijentsku
+  stranu, pa bez toga meduspremnik i prijenos datoteka ne rade (vidi poglavlje 11)
 
 ---
 
@@ -387,6 +389,54 @@ sparenih klijenata.
 
 Provjera da je sve preživjelo restart: `C:\Users\Public\boot-verify.txt`, koji zadatak
 `VerifyAfterBoot` zapiše 100 s nakon prijave.
+
+---
+
+### Meduspremnik i prijenos datoteka — most
+
+Sunshine i Moonlight **ne dijele ni meduspremnik ni datoteke.** To nije postavka koja
+nedostaje, nego funkcija koje u protokolu streama NEMA — `sunshine.exe` nema nijednu
+referencu na Windows clipboard API (`OpenClipboard`, `SetClipboardData`,
+`CF_UNICODETEXT` su sve nula). Zato u paketu ide `scripts\luxstream-bridge.ps1`, koji to
+radi običnim TCP-om, **izvan** protokola streama, pa radi s bilo kojom verzijom Sunshinea
+i Moonlighta.
+
+**Instalater registrira samo KLIJENTSKU polovicu** (u VM-u: zadatak `LuxstreamBridge`,
+pali se pri prijavi, sam se spaja). **Drugu polovicu treba pokrenuti na HOSTU, jednom.**
+Bez toga kopiranje ne radi, i to nigdje ne piše: klijent se mirno pokušava spojiti u
+nedogled, a u dnevniku se vidi samo „nema veze".
+
+Na HOSTU, iz povišenog PowerShella (skriptu najprije prekopiraj iz paketa ako je host
+nema — u VM-u je na `C:\Program Files\Luxstream\scripts\`):
+
+```powershell
+.\luxstream-bridge.ps1 -Mode Server -Install
+```
+
+To ispiše zajedničku tajnu i **točnu naredbu za vatrozid** — otvori port s njom. Mrežu
+**ne prepisuj iz dokumentacije**: adresa Default Switcha nije ista na svakom stroju
+(`172.29.32.1` je čest, `172.21.80.1` jednako tako). Skripta ju pročita sama i iz nje
+izvede i popis dopuštenih klijenata i mrežu u pravilu. Uz `-DopustiVatru` otvori port i
+sama.
+
+Tajna mora biti **ista na obje strane.** Ako si `-Install` već pokrenuo na hostu, prepiši
+njegovu tajnu i predaj je VM-u:
+
+```powershell
+.\INSTALL.ps1 -TajnaMosta '<tajna-s-hosta>'
+```
+
+Provjera i samotest rade bez ikakve vanjske veze:
+
+```powershell
+.\luxstream-bridge.ps1 -Status      # mreža, zadatak, vatrozid, zadnjih 15 redaka
+.\luxstream-bridge.ps1 -SelfTest    # pravi TCP na 127.0.0.1: tekst, PNG, datoteka
+```
+
+Dnevnik je `%USERPROFILE%\Luxstream\luxstream-bridge.log`.
+
+> **Most radi samo u interaktivnoj sesiji.** Kao Windows servis (sesija 0) ne vidi
+> meduspremnik korisnika — tiho, bez greške.
 
 ---
 

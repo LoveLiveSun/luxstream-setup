@@ -266,22 +266,38 @@ TCP, so it works with any Sunshine and Moonlight version:
 
 ### Host listens, VM connects
 
-The host on the *Default Switch* has a **fixed** address (`172.29.32.1`); a VM's address
-changes (DHCP, clones), so it would have to be rewritten on the host constantly. A client
-without `-Peer` simply uses the default gateway — which on the Default Switch is the host.
+The host on the *Default Switch* has a **fixed** address; a VM's address changes (DHCP,
+clones), so it would have to be rewritten on the host constantly. A client without `-Peer`
+simply uses the default gateway — which on the Default Switch is the host.
+
+> The Default Switch address is **not the same on every machine**: `172.29.32.1` is common,
+> but `172.21.80.1` is just as usual. The script reads it itself (`Nadji-Switch`) and derives
+> both the allowed-client list and the subnet in the firewall rule from it, then **prints a
+> ready-made command**. Do not copy an address out of this text — use the one `-Install`
+> prints, or check with `-Status`.
 
 On the **host**, once, from an elevated PowerShell:
 
 ```powershell
-New-NetFirewallRule -DisplayName 'Luxstream bridge' -Direction Inbound `
-  -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress 172.29.32.0/24
-
 .\scripts\luxstream-bridge.ps1 -Mode Server -Install
 ```
 
-`-Install` writes `C:\ProgramData\Luxstream\bridge.json`, generates a shared secret,
-prints it and registers the `LuxstreamBridge` task at logon. The installer in the VM
-already registers the client half; pass the host's secret to it so both sides match:
+`-Install` writes `C:\ProgramData\Luxstream\bridge.json`, generates a shared secret, prints it,
+registers the `LuxstreamBridge` task at logon, and prints the exact firewall command — open the
+port with it:
+
+```powershell
+# example only - -Install prints the real subnet and port for this machine
+New-NetFirewallRule -DisplayName 'Luxstream bridge' -Direction Inbound `
+  -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress 172.21.80.0/20
+```
+
+With `-DopustiVatru`, `-Install` opens the port itself (needs elevation). If registering the
+task did not succeed — and without elevation it will not — that is **said out loud**, because
+otherwise it is all too easy to believe the bridge is set up while no task exists anywhere.
+
+The installer in the VM already registers the client half; pass the host's secret to it so both
+sides match:
 
 ```powershell
 .\INSTALL.ps1 -TajnaMosta 'secret-from-the-host'
@@ -300,7 +316,8 @@ clipboard is invisible.
 ### Check it
 
 ```powershell
-# is it running, what is configured, last 15 log lines
+# is it running, what is configured, the network it detected, the firewall
+# rule, and the last 15 log lines
 .\scripts\luxstream-bridge.ps1 -Status
 
 # self-test with no outside connection - real TCP on 127.0.0.1: text with
@@ -324,6 +341,9 @@ scheduled task would be completely silent.
 - Names are sanitised (any path stripped, `<>:"|?*` and control characters become `_`,
   truncated to 180 chars); collisions get a `-1`, `-2`… suffix.
 - It needs an **interactive session**. As a service it does nothing — silently.
+- `-AllowedClients` filters by IP prefix. The prefix of this machine's Default Switch subnet
+  goes first and is detected automatically; the generic ones (`172.29.`, `192.168.`, `10.`,
+  `127.`) stay as a fallback. `-Status` prints the final list.
 
 ---
 

@@ -20,8 +20,8 @@
     POKRETANJE
     ==========================================================================
 
-    Na HOSTU (posluzitelj). Adresa hosta na Default Switchu je FIKSNa
-    (172.29.32.1), pa je host prirodna strana koja slusa:
+    Na HOSTU (posluzitelj). Host na Default Switchu ima fiksnu adresu, pa je
+    host prirodna strana koja slusa:
 
         .\luxstream-bridge.ps1 -Mode Server
 
@@ -30,9 +30,18 @@
 
         .\luxstream-bridge.ps1 -Mode Client
 
+    Adresa Default Switcha NIJE ista na svakom stroju: 172.29.32.1 je cest,
+    ali 172.21.80.1 je takoder uobicajen (vidi Nadji-Switch). Skripta ju sama
+    procita, pa se i popis dopustenih klijenata i naredba za vatrozid izvode
+    iz nje umjesto iz tvrde vrijednosti - inace most tiho odbija svaki spoj.
+
     Automatski (registrira zakazani zadatak pri prijavi):
 
         .\luxstream-bridge.ps1 -Mode Client -Install
+
+    Isto za posluzitelj, uz odmah otvoren port (trazi ovlasti):
+
+        .\luxstream-bridge.ps1 -Mode Server -Install -DopustiVatru
 
     Provjera na jednom stroju, bez ikakve vanjske veze:
 
@@ -49,7 +58,7 @@
     ==========================================================================
     ZASTO HOST SLUSA, A VM SE SPAJA
     ==========================================================================
-    Default Switch daje hostu 172.29.32.1 i to se ne mijenja. Adresa VM-a se
+    Default Switch daje hostu fiksnu adresu i to se ne mijenja. Adresa VM-a se
     mijenja (DHCP + klonovi), pa bi je na hostu trebalo stalno prepisivati.
     Ovako je jedina adresa koju treba znati - fiksna.
 
@@ -109,6 +118,8 @@ param(
   [switch]$NoClipboard,
   [switch]$NoFiles,
 
+  [switch]$DopustiVatru,                          # uz -Install -Mode Server: otvori port sada
+
   [switch]$Install,
   [switch]$Uninstall,
   [switch]$Status,
@@ -167,6 +178,60 @@ function Nova-Tajna {
   $b = New-Object byte[] 24
   [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
   ([BitConverter]::ToString($b)).Replace('-','').ToLower()
+}
+
+# ------------------------------------------------------ mreza (Default Switch)
+# Opis ove strane na Default Switchu - ili $null ako ga na stroju nema.
+#
+# Zasto se cita, a ne upisuje: u ovom se sklopu VM spaja na host preko Default
+# Switcha, pa se i popis dopustenih klijenata i pravilo vatrozida moraju
+# odnositi na TOCNO TU mrezu. ona NIJE svugdje 172.29.32.0/24. Kad se popis
+# ostavi tvrd ('172.29.'), posluzitelj na stroju s npr. 172.21.80.0/20 odbije
+# svaki spoj - u dnevniku pise ODBIJEN, a na drugoj strani samo puca veza bez
+# ijednog objasnjenja. Zato se prefiksi izvode iz stvarne adrese.
+function Nadji-Switch {
+  $k = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+         Where-Object { $_.InterfaceAlias -like '*Default Switch*' -and $_.IPAddress -notlike '169.254.*' } |
+         Select-Object -First 1
+  if (-not $k) { return $null }
+
+  $o = @($k.IPAddress.Split('.') | ForEach-Object { [int]$_ })
+  $p = [int]$k.PrefixLength
+
+  # mreza: adresa s maskom po bitovima (/20 -> 172.21.80.0)
+  $net = @(0, 0, 0, 0); $ostalo = $p
+  for ($i = 0; $i -lt 4; $i++) {
+    $bit = [Math]::Min(8, [Math]::Max(0, $ostalo))
+    if ($bit -eq 8) { $net[$i] = $o[$i] }
+    elseif ($bit -gt 0) { $net[$i] = $o[$i] -band (256 - [int][Math]::Pow(2, 8 - $bit)) }
+    $ostalo -= 8
+  }
+
+  # prefiks za usporedbu ide na granicu okteta (/20 -> '172.21.'), sto je sire
+  # od same mreze. Namjerno: prefiks je samo grubi filtar protiv tudih mreza,
+  # a stvarno odbija zajednicka tajna. Uzu, tocnu mrezu nosi pravilo vatrozida.
+  $koliko = [Math]::Floor($p / 8)
+  $pref = (($net[0..([Math]::Max(0, $koliko - 1))]) -join '.') + '.'
+
+  @{
+    Ali     = $k.InterfaceAlias
+    Ip      = $k.IPAddress
+    Prefiks = $p
+    Mreza   = (($net -join '.') + '/' + $p)
+    Tekst   = $pref
+  }
+}
+
+# Nadji-Switch se poziva s nekoliko mjesta (popis dopustenih, -Install, -Status).
+# Citanje se kesira: racuna se jednom, a svaki poziv vrati isti odgovor.
+$script:Mreza = $null
+$script:MrezaProcitano = $false
+function Daj-Mrezu {
+  if (-not $script:MrezaProcitano) {
+    $script:Mreza = Nadji-Switch
+    $script:MrezaProcitano = $true
+  }
+  $script:Mreza
 }
 
 # ------------------------------------------------------- meduspremnik (STA)
@@ -473,6 +538,22 @@ function Nadji-Proces {
 # ============================================================================
 #                                 ZADACI
 # ============================================================================
+# Popis dopustenih klijenata: ako ga korisnik nije zadao, prefiks ove mreze na
+# Default Switchu ide ispred opcih. Bez toga posluzitelj na stroju ciji switch
+# nije 172.29.32.0/24 odbije svaki spoj ("ODBIJEN" u dnevniku), a na drugoj
+# strani se vidi samo puknuta veza. Opci prefiksi ostaju kao rezerva za rucne
+# slucajeve (npr. klijent s drugog stroja u LAN-u).
+#
+# Ovo ide OVDJE, a ne u zadane vrijednosti param bloka: zadana vrijednost se
+# racuna prije nego je Nadji-Switch uopce definiran, a i mora se primijeniti i
+# na -Install i na -Status, koji se izvrsavaju iznad glavne petlje.
+if (-not $PSBoundParameters.ContainsKey('AllowedClients')) {
+  $sw = Daj-Mrezu
+  if ($sw -and ($AllowedClients -notcontains $sw.Tekst)) {
+    $AllowedClients = @($sw.Tekst) + $AllowedClients
+  }
+}
+
 $self = $MyInvocation.MyCommand.Path
 $skripte = Split-Path $self -Parent
 
@@ -519,28 +600,74 @@ if ($Install) {
               -ExecutionTimeLimit ([TimeSpan]::Zero) `
               -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
-  Register-ScheduledTask -TaskName $zadatak -Action $akcija -Trigger $okidac `
-    -Principal $princ -Settings $post -Force | Out-Null
+  # Registracija s -RunLevel Highest trazi ovlasti. Bez njih Register-ScheduledTask
+  # padne na "pristup odbijen" - a to je greska koja se ovdje NE vidi kao prekid
+  # (CIM cmdleti je ispisu, ali petlja ide dalje), pa bi se lako dogodilo da se
+  # ispise "zadatak registriran", a zadatka nema nigdje. Zato se uspjeh provjeri
+  # stvarno, a ne po tome sto naredba nije bacila izuzetak.
+  $regOk = $true
+  try {
+    Register-ScheduledTask -TaskName $zadatak -Action $akcija -Trigger $okidac `
+      -Principal $princ -Settings $post -Force -ErrorAction Stop | Out-Null
+  } catch {
+    $regOk = $false
+  }
 
-  Say "Zadatak '$zadatak' registriran ($Mode, port $Port)."
+  Say ''
+  if ($regOk) {
+    Say "Zadatak '$zadatak' registriran ($Mode, port $Port)."
+  } else {
+    Say "[!] Zadatak NIJE registriran - most se nece sam pokrenuti."
+    Say '    Pokreni -Install iz Powershella s ovlastima (Pokreni kao administrator).'
+  }
   Say "Konfiguracija: $konf"
   Say ''
   Say 'Zajednicka tajna - MORA BITI ista na obje strane:'
   Say ('  ' + $tajna)
   if ($Mode -eq 'Server') {
+    $sw = Daj-Mrezu
     Say ''
     Say "Na drugoj strani pokreni:  -Mode Client -Secret '$tajna'"
-    Say 'Klijent ne treba -Peer: sam uzme zadani gateway, a na Default Switchu'
-    Say 'je to upravo ova adresa (172.29.32.1).'
-    Say 'Ne zaboravi otvoriti port na ovoj strani:'
-    Say "  New-NetFirewallRule -DisplayName 'Luxstream bridge' -Direction Inbound -Protocol TCP ``"
-    Say "    -LocalPort $Port -Action Allow -RemoteAddress 172.29.32.0/24"
+    if ($sw) {
+      Say 'Klijent ne treba -Peer: sam uzme zadani gateway, a na Default Switchu'
+      Say "je to upravo ova adresa ($($sw.Ip) na $($sw.Ali))."
+    } else {
+      Say 'Na ovom stroju nema Default Switcha, pa klijent ne moze sam pogoditi'
+      Say 'adresu - pokreni ga s -Peer <adresa ovog stroja>.'
+    }
+
+    # Port mora biti otvoren: bez pravila Windows spoj tiho odbaci, a na drugoj
+    # strani samo puca veza bez objasnjenja. Pravilo se ograduje na mrezu s koje
+    # klijent dolazi - sire bi pustilo svakoga.
+    $pravilo = @{ DisplayName = 'Luxstream bridge'; Direction = 'Inbound'; Protocol = 'TCP'
+                  LocalPort = $Port; Action = 'Allow'; Profile = 'Any' }
+    if ($sw) { $pravilo.RemoteAddress = $sw.Mreza }
+    $naredba = "New-NetFirewallRule -DisplayName 'Luxstream bridge' -Direction Inbound " +
+               "-Protocol TCP -LocalPort $Port -Action Allow"
+    if ($sw) { $naredba += " -RemoteAddress $($sw.Mreza)" }
+
+    Say ''
+    if ($DopustiVatru) {
+      Remove-NetFirewallRule -DisplayName 'Luxstream bridge' -ErrorAction SilentlyContinue
+      try {
+        New-NetFirewallRule @pravilo -ErrorAction Stop | Out-Null
+        Say "Port $Port otvoren."
+      } catch {
+        Say "Port nisam mogao otvoriti sam: $($_.Exception.Message)"
+        Say 'Pokreni ovo iz Powershella s ovlastima:'
+        Say ('  ' + $naredba)
+      }
+    } else {
+      Say 'Ne zaboravi otvoriti port na ovoj strani (jednom, s ovlastima):'
+      Say ('  ' + $naredba)
+    }
   } else {
     Say ''
     Say 'Ne zaboravi na HOSTU pokrenuti drugu polovicu:'
     Say "  .\luxstream-bridge.ps1 -Mode Server -Secret '$tajna' -Install"
   }
-  Start-ScheduledTask -TaskName $zadatak -ErrorAction SilentlyContinue
+  # Ako registracija nije prosla, pokretanje nema smisla - zadatka nema.
+  if ($regOk) { Start-ScheduledTask -TaskName $zadatak -ErrorAction SilentlyContinue }
   return
 }
 
@@ -552,6 +679,17 @@ if ($Status) {
   Say ("Proces: " + $(if ($p) { "radi, PID $($p.ProcessId -join ',')" } else { 'NE radi' }))
   $t = Get-ScheduledTask -TaskName $zadatak -ErrorAction SilentlyContinue
   Say ("Zadatak: " + $(if ($t) { $t.State } else { 'nije registriran' }))
+
+  $sw = Daj-Mrezu
+  if ($sw) {
+    Say "Mreza:  $($sw.Ip)/$($sw.Prefiks) na $($sw.Ali)   (mreza $($sw.Mreza))"
+  } else {
+    Say 'Mreza:  nema Default Switcha na ovom stroju'
+  }
+  Say ("Dopusteni prefiksi: " + ($AllowedClients -join ', '))
+  $fw = Get-NetFirewallRule -DisplayName 'Luxstream bridge' -ErrorAction SilentlyContinue
+  if ($fw) { Say "Vatrozid: pravilo postoji ($($fw.Enabled))" } else { Say "Vatrozid: NEMA pravila za port $Port" }
+
   Say "Mape: $drop  ->  $prim"
   if (Test-Path $dnevnik) {
     Say ''
@@ -726,24 +864,38 @@ if (-not $Secret) {
   throw 'Nema zajednicke tajne. Zadaj -Secret ili pokreni -Install.'
 }
 
-# Klijent: ako -Peer nije zadan, uzmi zadani gateway. Na Default Switchu je to
-# host (172.29.32.1) - jedina adresa u ovom sklopu koja se ne mijenja.
-if ($Mode -eq 'Client' -and -not $Peer) {
-  try {
-    $ruta = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
-              Sort-Object RouteMetric | Select-Object -First 1
-    $Peer = $ruta.NextHop
-  } catch { }
-  if (-not $Peer -or $Peer -eq '0.0.0.0') {
-    Log 'most nije pokrenut: ne mogu sam odrediti adresu posluzitelja'
-    throw 'Ne mogu sam odrediti adresu posluzitelja. Zadaj -Peer <ip>.'
+# Klijent: koje adrese posluzitelja uopce pokusavati.
+#
+# Uz -Peer se ne nagada - pokusava se tocno ta jedna. Bez -Peer se uzima zadani
+# gateway, a to je na Default Switchu upravo host.
+#
+# Zasto ih moze biti VISE: stroj s Default Switchom cesto ima i drugu zadanu
+# rutu (vanjski LAN). Gateway s najboljom metrikom tada ne mora biti host, pa
+# bi se klijent zauvijek kucao na vrata koja nisu nigdje. Zato se pamte svi
+# kandidati i pokusavaju po redu - pogresan se preskoci u sljedecem krugu.
+$kandidati = @()
+if ($Mode -eq 'Client') {
+  if ($Peer) {
+    $kandidati = @($Peer)
+  } else {
+    try {
+      $kandidati = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+                       Sort-Object RouteMetric |
+                       ForEach-Object { $_.NextHop } |
+                       Where-Object { $_ -and $_ -ne '0.0.0.0' } |
+                       Select-Object -Unique)
+    } catch { }
+    if ($kandidati.Count -eq 0) {
+      Log 'most nije pokrenut: ne mogu sam odrediti adresu posluzitelja'
+      throw 'Ne mogu sam odrediti adresu posluzitelja. Zadaj -Peer <ip>.'
+    }
+    Say ('Posluzitelj (zadani gateway): ' + ($kandidati -join ', '))
   }
-  Say "Posluzitelj (zadani gateway): $Peer"
 }
 
-function Povezi-Se {
+function Povezi-Se([string]$Adresa) {
   $klijent = [System.Net.Sockets.TcpClient]::new()
-  $klijent.Connect($Peer, $Port)
+  $klijent.Connect($Adresa, $Port)
   $s = $klijent.GetStream()
   $s.ReadTimeout = 15000
   $s.WriteTimeout = 30000
@@ -802,20 +954,26 @@ function Vrti-Posluzitelj {
 
 # ---------------------------------------------------------------------- klijent
 function Vrti-Klijenta {
-  Say "Most RADI - klijent prema ${Peer}:$Port"
+  Say "Most RADI - klijent prema $($kandidati -join ', '):$Port"
   Say ("Drop: $drop   ->   Primljeno: $prim")
   $cekaj = 2
+  $i = 0
   while ($true) {
+    $adresa = $kandidati[$i % $kandidati.Count]
+    $v = $null          # bez ovoga bi neuspjeh ostavio proslu, vec zatvorenu vezu
     try {
-      $v = Povezi-Se
-      Log "spojen na ${Peer}:$Port"
+      $v = Povezi-Se $adresa
+      Log "spojen na ${adresa}:$Port"
       $cekaj = 2
       Sync-Loop $v.Klijent $v.Stream 'Client'
     } catch {
-      Log "nema veze ($($_.Exception.Message)); novi pokusaj za $cekaj s"
+      Log "nema veze na ${adresa}:$Port ($($_.Exception.Message)); novi pokusaj za $cekaj s"
     } finally {
       try { if ($v) { $v.Klijent.Close() } } catch { }
     }
+    # Vise kandidata -> svaki krug ide na sljedecu adresu, pa se pogresan
+    # gateway preskoci u jednom krugu umjesto zauvijek.
+    if ($kandidati.Count -gt 1) { $i++ }
     Start-Sleep -Seconds $cekaj
     if ($cekaj -lt 30) { $cekaj = [Math]::Min(30, $cekaj * 2) }
   }

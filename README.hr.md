@@ -366,21 +366,36 @@ Most zamjenjuje stari `clipboard-bridge.ps1`, koji je prenosio samo tekst.
 
 ### Koja strana sluša
 
-**Host sluša, VM se spaja.** Host na *Default Switchu* ima fiksnu adresu `172.29.32.1`; adresa
-VM-a se mijenja (DHCP i klonovi), pa bi se na hostu stalno morala prepisivati. Klijent bez
-`-Peer` sam uzme zadani gateway — a to je na Default Switchu upravo host.
+**Host sluša, VM se spaja.** Host na *Default Switchu* ima fiksnu adresu; adresa VM-a se
+mijenja (DHCP i klonovi), pa bi se na hostu stalno morala prepisivati. Klijent bez `-Peer`
+sam uzme zadani gateway — a to je na Default Switchu upravo host.
+
+> Adresa Default Switcha **nije ista na svakom stroju**: `172.29.32.1` je čest, ali
+> `172.21.80.1` je jednako uobičajen. Skripta ju sama pročita (`Nadji-Switch`), iz nje izvede
+> i popis dopuštenih klijenata i mrežu u pravilu vatrozida, i **ispiše gotovu naredbu**.
+> Ne prepisuj adresu iz ovog teksta — uzmi onu koju ispiše `-Install`, ili provjeri s
+> `-Status`.
 
 **Na HOSTU** (jednom, iz povišenog PowerShella):
 
 ```powershell
-New-NetFirewallRule -DisplayName 'Luxstream bridge' -Direction Inbound `
-  -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress 172.29.32.0/24
-
 .\scripts\luxstream-bridge.ps1 -Mode Server -Install
 ```
 
 `-Install` zapiše konfiguraciju u `C:\ProgramData\Luxstream\bridge.json`, izgenerira
-zajedničku tajnu, ispiše ju i registrira zadatak `LuxstreamBridge` koji se pokreće pri prijavi.
+zajedničku tajnu, ispiše ju, registrira zadatak `LuxstreamBridge` koji se pokreće pri prijavi,
+i ispiše točnu naredbu za vatrozid — otvori port s njom:
+
+```powershell
+# primjer - mrežu i port ispiše -Install, vrijednosti ovdje su samo ilustracija
+New-NetFirewallRule -DisplayName 'Luxstream bridge' -Direction Inbound `
+  -Protocol TCP -LocalPort 51888 -Action Allow -RemoteAddress 172.21.80.0/20
+```
+
+Uz `-DopustiVatru` `-Install` otvara port i sam (traži ovlasti). Ako registracija zadatka
+nije prošla — a bez ovlasti neće — to se **ispiše naglas**, jer bi inače bilo lako pomisliti
+da je most postavljen, a zadatka da nema nigdje.
+
 **Tajna mora biti ista na obje strane** — pokreni `-Install` na hostu, prepiši ispisanu tajnu, pa
 je na VM-u predaj kao `-TajnaMosta`:
 
@@ -452,7 +467,9 @@ lokalna anketa vidjela vlastiti zapis kao „novo" i poslala ga natrag u petlji.
 - Ime se sanira (odbacuje se svaka putanja, `<>:"|?*` i upravljački znakovi idu u `_`,
   skraćuje na 180 znakova), a kolizija dobiva sufiks `-1`, `-2`…
 - Radi **samo u interaktivnoj sesiji**. Kao servis ne radi — tiho, bez greške.
-- `-AllowedClients` ograničava po IP prefiksu (zadano `172.29.`, `192.168.`, `10.`, `127.`).
+- `-AllowedClients` ograničava po IP prefiksu. Prefiks ove mreže na Default Switchu ide
+  prvi i sam se izvede; opći (`172.29.`, `192.168.`, `10.`, `127.`) ostaju kao rezerva.
+  `-Status` ispiše konačan popis.
 
 ---
 
