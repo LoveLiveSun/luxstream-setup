@@ -115,15 +115,68 @@ $kljuceviUninstall = @(
 function Dnevnik($m) {
   try { Add-Content -Path $dnevnik -Value $m -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
 }
+# REDOSLIJED JE VAZAN: prvo dnevnik, pa konzola.
+# Ako je u konzoli aktivno oznacavanje (conhost "Select" / QuickEdit - dovoljan
+# je jedan klik ili prevlacenje misem), Write-Host se BLOKIRA dok se selekcija ne
+# ponisti (desni klik ili Esc). Dok je Write-Host bio prvi, dnevnik je stajao na
+# zadnjem USPJESNO ispisanom retku, pa se nije moglo znati gdje je deinstalater
+# stao - 31.10.2026. je izgledalo kao da je zapeo na fazi 4 (VB-Audio), a
+# nastavio je tek kad je korisnik kliknuo desnom tipkom.
+# Sada se dnevnik pise prvi, pa i u tom slucaju pokazuje pravo mjesto.
 function Head($m) {
-  if (-not $Tiho) { Write-Host "`n=== $m" -ForegroundColor Cyan }
   Dnevnik "`n=== $m"
+  if (-not $Tiho) { Write-Host "`n=== $m" -ForegroundColor Cyan }
 }
-function Ok  ($m) { if (-not $Tiho) { Write-Host "  [OK]   $m" -ForegroundColor Green };  Dnevnik "  [OK]   $m" }
-function Inf ($m) { if (-not $Tiho) { Write-Host "  [..]   $m" };                          Dnevnik "  [..]   $m" }
-function Warn($m) { if (-not $Tiho) { Write-Host "  [!]    $m" -ForegroundColor Yellow };  Dnevnik "  [!]    $m" }
-function Bad ($m) { if (-not $Tiho) { Write-Host "  [FAIL] $m" -ForegroundColor Red };     Dnevnik "  [FAIL] $m"; $script:greske++ }
-function Nema($m) { if (-not $Tiho) { Write-Host "  [--]   $m" -ForegroundColor DarkGray }; Dnevnik "  [--]   $m" }
+function Ok  ($m) { Dnevnik "  [OK]   $m";   if (-not $Tiho) { Write-Host "  [OK]   $m" -ForegroundColor Green } }
+function Inf ($m) { Dnevnik "  [..]   $m";   if (-not $Tiho) { Write-Host "  [..]   $m" } }
+function Warn($m) { Dnevnik "  [!]    $m";   if (-not $Tiho) { Write-Host "  [!]    $m" -ForegroundColor Yellow } }
+function Bad ($m) { Dnevnik "  [FAIL] $m";   if (-not $Tiho) { Write-Host "  [FAIL] $m" -ForegroundColor Red }; $script:greske++ }
+function Nema($m) { Dnevnik "  [--]   $m";   if (-not $Tiho) { Write-Host "  [--]   $m" -ForegroundColor DarkGray } }
+
+# ============================================================ KONZOLA =======
+# OZNACAVANJE MISEM ZAMRZAVA DEINSTALACIJU.
+# U konzoli s ukljucenim QuickEditom svaki klik ili prevlacenje misem otvara
+# selekciju, a conhost tada BLOKIRA svaki sljedeci ispis: deinstalater stane i
+# izgleda mrtav iako proces normalno radi. Vidjeno 31.10.2026. na VM-u - korisnik
+# je kliknuo u prozor i deinstalacija je stala na fazi 4 (VB-Audio); nastavila je
+# tek kad je kliknuo desnom tipkom. Isti se mehanizam vidi i kod obicnog pinga.
+# Zato se QuickEdit gasi odmah na pocetku. Cijena je da se tekst iz konzole ne
+# moze vise oznaciti misem - ali cijeli ispis ionako ide u
+# C:\Users\Public\luxstream-uninstall.log, pa se odande moze kopirati.
+# Ctrl+M (mark mode) ostaje moguc, ali njega nitko ne pritisne slucajno.
+#
+# Klasa se zove KONZOLA, a ne PROZOR kao u INSTALL.ps1: ovdje trebaju samo tri
+# funkcije ulaznog handlea. Deinstalater NE mijenja topologiju displaya, pa mu
+# Vrati-Prozor i citav SetWindowPos dio ne trebaju.
+if (-not ('KONZOLA' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class KONZOLA {
+  [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int n);
+  [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out int m);
+  [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, int m);
+}
+'@
+}
+# 0x0080 = ENABLE_EXTENDED_FLAGS - bez njega se promjena QuickEdita ignorira
+# 0x0040 = ENABLE_QUICK_EDIT_MODE
+function Iskljuci-Oznacavanje {
+  try {
+    $h = [KONZOLA]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+    if ($h -eq [IntPtr]::Zero) { return }
+    $m = 0
+    if (-not [KONZOLA]::GetConsoleMode($h, [ref]$m)) { return }
+    $novi = ($m -bor 0x0080) -band (-bnot 0x0040)
+    [void][KONZOLA]::SetConsoleMode($h, [int]$novi)
+  } catch { }
+}
+# Poziv je OVDJE, a ne pri kraju: elevacija (RunAs) pokrece NOVU instancu u
+# novom konzolnom prozoru, a nova instanca izvrsava skriptu od pocetka - pa se
+# ovaj poziv ponovi i u povisenom prozoru. Da se zvao samo jednom pri kraju,
+# poviseni prozor (onaj u kojem korisnik stvarno gleda ispis) ostao bi bez
+# zastite.
+Iskljuci-Oznacavanje
 
 # ============================================================ POMOCNE =======
 function Test-Poviseno {
