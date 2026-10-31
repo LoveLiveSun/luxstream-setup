@@ -109,15 +109,24 @@ foreach ($p in @($sys, (Join-Path $sys 'WindowsPowerShell\v1.0'), (Join-Path $en
 # Na svakom prijelazu faze vrati konzolu na glavni zaslon. Instalacija vise puta
 # mijenja topologiju i pali tudje procese koji dolaze u prvi plan, pa prozor zna
 # zavrsiti na zaslonu kojeg vise nema - korisnik tada gleda prazan desktop.
+# REDOSLIJED JE VAZAN: prvo dnevnik, pa konzola.
+# Ako je u konzoli aktivno oznacavanje (conhost "Select" / QuickEdit - dovoljan
+# je jedan klik ili prevlacenje misem), Write-Host se BLOKIRA dok se oznacavanje
+# ne ponisti. To je isti mehanizam po kojem se `ping` zamrzne kad se tekst
+# oznaci. Dok je Write-Host bio prvi, dnevnik je stajao na zadnjem USPJESNO
+# ispisanom retku, pa se nije moglo znati gdje je instalacija stala.
+# Vidjeno 31.10.2026. na VM-u: dnevnik je zavrsavao na "extend rc=0" i izgledalo
+# je kao da je instalater mrtav tocno tamo, a stajao je na prvom ispisu SLJEDECE
+# faze. Sada se dnevnik pise prvi, pa i u tom slucaju pokazuje pravo mjesto.
 function Head($m) {
   if (Get-Command Vrati-Prozor -ErrorAction SilentlyContinue) { Vrati-Prozor }
-  Write-Host "`n=== $m" -ForegroundColor Cyan
   Add-Content $dnevnik "`n=== $m"
+  Write-Host "`n=== $m" -ForegroundColor Cyan
 }
-function Ok  ($m) { Write-Host "  [OK]   $m" -ForegroundColor Green;  Add-Content $dnevnik "  [OK]   $m" }
-function Inf ($m) { Write-Host "  [..]   $m";                          Add-Content $dnevnik "  [..]   $m" }
-function Warn($m) { Write-Host "  [!]    $m" -ForegroundColor Yellow;  Add-Content $dnevnik "  [!]    $m" }
-function Bad ($m) { Write-Host "  [FAIL] $m" -ForegroundColor Red;     Add-Content $dnevnik "  [FAIL] $m"; $script:greske++ }
+function Ok  ($m) { Add-Content $dnevnik "  [OK]   $m"; Write-Host "  [OK]   $m" -ForegroundColor Green }
+function Inf ($m) { Add-Content $dnevnik "  [..]   $m"; Write-Host "  [..]   $m" }
+function Warn($m) { Add-Content $dnevnik "  [!]    $m"; Write-Host "  [!]    $m" -ForegroundColor Yellow }
+function Bad ($m) { Add-Content $dnevnik "  [FAIL] $m"; Write-Host "  [FAIL] $m" -ForegroundColor Red; $script:greske++ }
 
 # Vraca $true/$false umjesto da baci. Ranije je iznimka bila samo ispisana (jer
 # je ErrorActionPreference = Continue), a odmah zatim se javio [OK] - lazno.
@@ -197,11 +206,41 @@ public class PROZOR {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+
+  // Za Iskljuci-Oznacavanje. QuickEdit je svojstvo ULAZNOG handlea konzole.
+  [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int n);
+  [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out int m);
+  [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, int m);
+
   public const uint SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004, SWP_SHOWWINDOW = 0x0040;
   public const int SW_RESTORE = 9;
 }
 '@
 }
+
+# OZNACAVANJE MISEM ZAMRZAVA INSTALACIJU.
+# U konzoli s ukljucenim QuickEditom svaki klik ili prevlacenje misem otvara
+# selekciju, a conhost tada BLOKIRA svaki sljedeci ispis: instalater stane i
+# izgleda mrtav iako proces normalno radi. Vidjeno 31.10.2026. na VM-u - korisnik
+# je kliknuo u prozor (da kopira ispis) i instalacija je stala.
+# Zato se QuickEdit gasi odmah na pocetku. Cijena je da se tekst iz konzole ne
+# moze vise oznaciti misem - ali cijeli ispis ionako ide u
+# C:\Users\Public\luxstream-install.log, pa se odande moze kopirati.
+# Ctrl+M (mark mode) ostaje moguc, ali njega nitko ne pritisne slucajno.
+#
+# 0x0080 = ENABLE_EXTENDED_FLAGS - bez njega se promjena QuickEdita ignorira
+# 0x0040 = ENABLE_QUICK_EDIT_MODE
+function Iskljuci-Oznacavanje {
+  try {
+    $h = [PROZOR]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+    if ($h -eq [IntPtr]::Zero) { return }
+    $m = 0
+    if (-not [PROZOR]::GetConsoleMode($h, [ref]$m)) { return }
+    $novi = ($m -bor 0x0080) -band (-bnot 0x0040)
+    [void][PROZOR]::SetConsoleMode($h, [int]$novi)
+  } catch { }
+}
+Iskljuci-Oznacavanje
 
 function Vrati-Prozor {
   try {
