@@ -1,0 +1,67 @@
+Luxstream pairing: no PIN for the user to carry between the two machines.
+
+Stock Moonlight shows a four-digit PIN and asks the user to type it into the
+host's Web UI before pairing completes.  In Luxstream the host is configured to
+answer the pairing handshake with a fixed PIN on its own (PAIRING_PIN in
+Sunshine's src/nvhttp.cpp, changed separately), so there is no code to read off
+one screen and type into the other.  This patch removes the dialog that would
+otherwise sit there waiting for an answer that is never needed.
+
+Two files change:
+  app/backend/computermanager.cpp   generatePinString() returns "0000"
+  app/gui/PcView.qml                pairing dialog is no longer opened
+
+Both sides must agree on the PIN.  Changing only this patch leaves pairing
+failing with "The PIN from the PC didn't match".
+
+Apply from the root of a moonlight-qt checkout:
+  git apply moonlight-bez-pina.patch
+  # or: patch -p1 < moonlight-bez-pina.patch
+
+The patch is written against LF sources; with core.autocrlf=true a plain
+"git apply" rewrites the whole file to CRLF.  Disable the conversion if that
+matters:
+  git -c core.autocrlf=false apply moonlight-bez-pina.patch
+
+QML is compiled into qml_qmlcache.qrc inside Moonlight.exe, so the client has to
+be recompiled for the dialog to actually disappear.
+
+diff --git a/app/backend/computermanager.cpp b/app/backend/computermanager.cpp
+index 96177da..ca9f489 100644
+--- a/app/backend/computermanager.cpp
++++ b/app/backend/computermanager.cpp
+@@ -1005,7 +1005,12 @@ void ComputerManager::addNewHost(NvAddress address, bool mdns, QString name, NvA
+ 
+ QString ComputerManager::generatePinString()
+ {
+-    return QString::asprintf("%04u", QRandomGenerator::system()->bounded(10000));
++    // Luxstream: the host answers the pairing handshake with this same fixed PIN
++    // on its own (see PAIRING_PIN in Sunshine's src/nvhttp.cpp), so there is no
++    // four-digit code for a human to carry from one machine to the other.
++    // Changing one side without the other breaks pairing with
++    // "The PIN from the PC didn't match".
++    return QStringLiteral("0000");
+ }
+ 
+ #include "computermanager.moc"
+diff --git a/app/gui/PcView.qml b/app/gui/PcView.qml
+index e80135c..02058ee 100644
+--- a/app/gui/PcView.qml
++++ b/app/gui/PcView.qml
+@@ -235,12 +235,11 @@ CenteredGridView {
+                 else {
+                     var pin = computerModel.generatePinString()
+ 
+-                    // Kick off pairing in the background
++                    // Luxstream: the host accepts this fixed PIN by itself, so
++                    // pairing runs entirely in the background. There is no code
++                    // for the user to copy into the host's Web UI, hence no PIN
++                    // dialog. Failures still surface via pairingComplete().
+                     computerModel.pairComputer(index, pin)
+-
+-                    // Display the pairing dialog
+-                    pairDialog.pin = pin
+-                    pairDialog.open()
+                 }
+             } else if (!model.online) {
+                 // Using open() here because it may be activated by keyboard

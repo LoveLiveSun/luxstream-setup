@@ -1,0 +1,2483 @@
+Luxstream bridge: clipboard and file transfer between the host and the Hyper-V VM.
+
+Sunshine and Moonlight stream the *console* session.  Windows' own clipboard
+redirection (RDP / Enhanced Session Mode) does not exist there, so there is
+nothing in the streaming protocol that could carry a Ctrl+C from one machine to
+the other.  This patch adds a small TCP service to the Moonlight client that
+speaks a private framed protocol with luxstream-bridge.ps1 on the VM side.  The
+service starts only when it finds luxstream-bridge.json in the user profile;
+otherwise LuxBridge::start() returns nullptr and nothing else changes.
+
+Four files change:
+  app/app.pro                    backend/luxbridge.cpp/.h added to the build
+  app/main.cpp                   LuxBridge::start() on the main thread
+  app/backend/luxbridge.cpp      NEW - server, protocol, clipboard, send engine
+  app/backend/luxbridge.h        NEW - Connection table and frame constants
+
+The protocol (1 byte type, 4 byte little-endian length, payload):
+
+  0x01 greeting            0x02 greeting reply ("OK" / "NO")
+  0x10 clipboard text      0x11 clipboard image (PNG)
+  0x12 file-group announce (JSON {count, ukupno})
+  0x20 file header         (JSON {name, size, rel?})
+  0x21 file chunk          (256 KB)
+  0x22 file end
+  0x30 PAUZA  - receiver asks the sender to stop pushing (JSON {name, size})
+  0x31 NASTAVI - receiver asks the sender to continue (empty)
+
+0x30 / 0x31 were added on 01.11.2026.  They exist because Ctrl+C starts the
+copy: an ISO takes minutes to reach the VM, so a Ctrl+V typed while the bytes
+are still moving pastes whatever was on the clipboard *before*.  With these two
+frames the VM creates the destination file up front, puts the file on its
+clipboard immediately and asks the host to hold; the host stops feeding the
+socket, and the transfer runs at full speed once the user actually pastes.  A
+peer that does not know the frames logs "nepoznat tip okvira" and ignores them,
+so mixing versions degrades to the old behaviour instead of breaking.
+
+Apply from the root of a moonlight-qt checkout:
+  git apply moonlight-luxstream-bridge.patch
+  # or: patch -p1 < moonlight-luxstream-bridge.patch
+
+The patch is written against LF sources.  On a Windows box with
+core.autocrlf=true the two NEW files are added with CRLF line endings, which is
+harmless - but if that matters, disable the conversion:
+  git -c core.autocrlf=false apply moonlight-luxstream-bridge.patch
+
+This is not a cosmetic change: the client has to be recompiled for the bridge to
+exist at all.  Luxstream-Moonlight-Host.exe ships the resulting Moonlight.exe
+prebuilt, so an end user never applies this patch - it is here so that the
+binary can be rebuilt from source.
+
+diff --git a/app/app.pro b/app/app.pro
+index 1c0661b..f2373c4 100644
+--- a/app/app.pro
++++ b/app/app.pro
+@@ -177,6 +177,7 @@ SOURCES += \
+     backend/nvpairingmanager.cpp \
+     backend/computermanager.cpp \
+     backend/boxartmanager.cpp \
++    backend/luxbridge.cpp \
+     backend/richpresencemanager.cpp \
+     cli/commandlineparser.cpp \
+     cli/listapps.cpp \
+@@ -221,6 +222,7 @@ HEADERS += \
+     backend/nvpairingmanager.h \
+     backend/computermanager.h \
+     backend/boxartmanager.h \
++    backend/luxbridge.h \
+     backend/richpresencemanager.h \
+     cli/commandlineparser.h \
+     cli/listapps.h \
+diff --git a/app/backend/luxbridge.cpp b/app/backend/luxbridge.cpp
+new file mode 100644
+index 0000000..217235a
+--- /dev/null
++++ b/app/backend/luxbridge.cpp
+@@ -0,0 +1,2008 @@
++// NOMINMAX has to be set before anything pulls in <windows.h>, or the min/max
++// macros it defines eat std::min/std::max and Qt's own use of them.
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++// GetDpiForWindow/GetDpiForSystem are Windows 10 1607 and only appear when the
++// target is declared as such. Qt 6 already requires Windows 10, so this only
++// makes the declaration visible to the compiler.
++#ifndef WINVER
++#define WINVER 0x0A00
++#endif
++#ifndef _WIN32_WINNT
++#define _WIN32_WINNT 0x0A00
++#endif
++#include <windows.h>
++#include <atomic>
++#include <mutex>
++#include <thread>
++#endif
++
++#include "luxbridge.h"
++
++#include <QBuffer>
++#include <QCryptographicHash>
++#include <QDateTime>
++#include <QDir>
++#include <QDirIterator>
++#include <QFileInfo>
++#include <QGuiApplication>
++#include <QClipboard>
++#include <QHostAddress>
++#include <QImage>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QMimeData>
++#include <QTcpServer>
++#include <QTcpSocket>
++#include <QTimer>
++#include <QSet>
++#include <QUrl>
++#include <QtEndian>
++#include <QtDebug>
++
++// Frame types, matching luxstream-bridge.ps1
++static constexpr quint8 kFrameGreeting = 0x01;
++static constexpr quint8 kFrameGreetingReply = 0x02;
++static constexpr quint8 kFrameText = 0x10;
++static constexpr quint8 kFrameImage = 0x11;
++static constexpr quint8 kFrameClipGroup = 0x12;
++static constexpr quint8 kFrameFileHeader = 0x20;
++static constexpr quint8 kFrameFileChunk = 0x21;
++static constexpr quint8 kFrameFileEnd = 0x22;
++
++// Added 01.11.2026. together with the lazy paste on the other side.
++//
++// The receiver now puts the clipboard up BEFORE the bytes arrive: it creates a
++// file of the announced size, hands Explorer that path, and only then asks us
++// to wait. The point of the hold frame is that "wait" has to mean wait - the
++// whole complaint being fixed was that Ctrl+C started the transfer, so a paste
++// made while the transfer was still running grabbed whatever was on the
++// clipboard at that moment and the file never reached the paste destination.
++//
++// An older peer knows neither frame and answers with "nepoznat tip okvira",
++// which is logged and ignored - so a new VM against an old host, or the other
++// way round, degrades to the old behaviour instead of breaking.
++static constexpr quint8 kFrameHold = 0x30;
++static constexpr quint8 kFrameResume = 0x31;
++
++// ---------------------------------------------------------------------------
++// Progress window
++//
++// The bridge had no way at all to show that a copy was running: a 4.9 GB file
++// took two and a half minutes and the only sign of life was a log line at the
++// end. This is the missing feedback.
++//
++// It is a plain Win32 window on its own thread, not a Qt dialog. Moonlight is
++// a Qt Quick application built on QGuiApplication, so QtWidgets - and with it
++// QProgressDialog - is not linked at all, and linking it would mean shipping
++// another Qt DLL and starting the app as QApplication instead. A native window
++// needs only user32/gdi32, which the app already links, and because it never
++// touches Qt's event loop it cannot stall a transfer or the clipboard poll.
++// ---------------------------------------------------------------------------
++#ifdef Q_OS_WIN
++namespace {
++
++constexpr UINT kMsgRepaint = WM_APP + 1;
++constexpr UINT kMsgShow = WM_APP + 2;
++constexpr UINT kMsgHide = WM_APP + 3;
++
++struct ProgressWindow
++{
++    HWND          hwnd = nullptr;
++    std::thread   worker;
++    std::mutex    textMutex;
++    QString       title;
++    QString       name;
++
++    std::atomic<qint64> total{0};
++    std::atomic<qint64> done{0};
++    std::atomic<qint64> speed{0};
++    std::atomic<bool>   finished{false};
++
++    bool started = false;
++    bool visible = false;
++};
++
++ProgressWindow g_pw;
++
++QString fmtAmount(qint64 bytes)
++{
++    if (bytes >= 1024LL * 1024 * 1024) {
++        return QStringLiteral("%1 GB").arg(QString::number(bytes / 1073741824.0, 'f', 2));
++    }
++    return QStringLiteral("%1 MB").arg(QString::number(bytes / 1048576.0, 'f', 1));
++}
++
++QString fmtEta(qint64 seconds)
++{
++    if (seconds < 0) {
++        return QStringLiteral("--:--");
++    }
++    const qint64 h = seconds / 3600;
++    const qint64 m = (seconds % 3600) / 60;
++    const qint64 s = seconds % 60;
++    if (h > 0) {
++        return QStringLiteral("%1:%2:%3").arg(h)
++                .arg(m, 2, 10, QLatin1Char('0')).arg(s, 2, 10, QLatin1Char('0'));
++    }
++    return QStringLiteral("%1:%2").arg(m).arg(s, 2, 10, QLatin1Char('0'));
++}
++
++HFONT makeFont(double scale, int pointSize, bool bold)
++{
++    return CreateFontW(-static_cast<int>(pointSize * scale * 96.0 / 72.0 + 0.5),
++                       0, 0, 0,
++                       bold ? FW_SEMIBOLD : FW_NORMAL,
++                       FALSE, FALSE, FALSE,
++                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
++                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
++                       L"Segoe UI");
++}
++
++void fillRect(HDC dc, const RECT& rc, COLORREF color)
++{
++    HBRUSH brush = CreateSolidBrush(color);
++    FillRect(dc, &rc, brush);
++    DeleteObject(brush);
++}
++
++void drawCard(HWND hwnd, HDC dc)
++{
++    RECT rc;
++    GetClientRect(hwnd, &rc);
++
++    const UINT dpi = GetDpiForWindow(hwnd) != 0 ? GetDpiForWindow(hwnd) : 96;
++    const double s = dpi / 96.0;
++
++    const qint64 total = g_pw.total.load();
++    const qint64 done = g_pw.done.load();
++    const qint64 speed = g_pw.speed.load();
++    const bool finished = g_pw.finished.load();
++
++    QString title;
++    QString name;
++    {
++        std::lock_guard<std::mutex> lock(g_pw.textMutex);
++        title = g_pw.title;
++        name = g_pw.name;
++    }
++
++    const int pad = static_cast<int>(16 * s);
++
++    // Card
++    fillRect(dc, rc, RGB(30, 31, 36));
++
++    {
++        HPEN pen = CreatePen(PS_SOLID, 1, RGB(64, 67, 76));
++        HGDIOBJ oldPen = SelectObject(dc, pen);
++        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
++        Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
++        SelectObject(dc, oldBrush);
++        SelectObject(dc, oldPen);
++        DeleteObject(pen);
++    }
++
++    SetBkMode(dc, TRANSPARENT);
++
++    // Title, left; percent, right
++    {
++        HFONT font = makeFont(s, 11, true);
++        HGDIOBJ old = SelectObject(dc, font);
++        SetTextColor(dc, RGB(235, 235, 240));
++
++        RECT r{ rc.left + pad, rc.top + static_cast<int>(10 * s),
++                rc.right - pad, rc.top + static_cast<int>(32 * s) };
++        DrawTextW(dc, reinterpret_cast<const wchar_t*>(title.utf16()), -1, &r,
++                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
++
++        const int pct = (total > 0) ? static_cast<int>(done * 100 / total)
++                                    : (finished ? 100 : 0);
++        const QString pctText = QStringLiteral("%1 %").arg(pct);
++        DrawTextW(dc, reinterpret_cast<const wchar_t*>(pctText.utf16()), -1, &r,
++                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
++
++        SelectObject(dc, old);
++        DeleteObject(font);
++    }
++
++    // File name
++    {
++        HFONT font = makeFont(s, 10, false);
++        HGDIOBJ old = SelectObject(dc, font);
++        SetTextColor(dc, RGB(190, 193, 200));
++
++        RECT r{ rc.left + pad, rc.top + static_cast<int>(34 * s),
++                rc.right - pad, rc.top + static_cast<int>(54 * s) };
++        DrawTextW(dc, reinterpret_cast<const wchar_t*>(name.utf16()), -1, &r,
++                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_PATH_ELLIPSIS);
++
++        SelectObject(dc, old);
++        DeleteObject(font);
++    }
++
++    // Bar
++    const int barTop = rc.top + static_cast<int>(62 * s);
++    const int barHeight = static_cast<int>(10 * s);
++    RECT track{ rc.left + pad, barTop, rc.right - pad, barTop + barHeight };
++    fillRect(dc, track, RGB(56, 58, 66));
++
++    double fraction = 0.0;
++    if (total > 0) {
++        fraction = static_cast<double>(done) / static_cast<double>(total);
++    }
++    else if (finished) {
++        fraction = 1.0;
++    }
++    if (fraction < 0.0) {
++        fraction = 0.0;
++    }
++    if (fraction > 1.0) {
++        fraction = 1.0;
++    }
++    if (fraction > 0.0) {
++        RECT fill = track;
++        fill.right = track.left + static_cast<int>((track.right - track.left) * fraction);
++        if (fill.right <= fill.left) {
++            fill.right = fill.left + 1;
++        }
++        fillRect(dc, fill, finished ? RGB(120, 200, 140) : RGB(120, 150, 255));
++    }
++
++    // Detail line
++    {
++        HFONT font = makeFont(s, 9, false);
++        HGDIOBJ old = SelectObject(dc, font);
++        SetTextColor(dc, RGB(150, 155, 165));
++
++        QString detail;
++        if (total > 0) {
++            detail = QStringLiteral("%1 / %2").arg(fmtAmount(done)).arg(fmtAmount(total));
++        }
++        else {
++            detail = fmtAmount(done);
++        }
++
++        if (speed > 0 && !finished) {
++            detail += QStringLiteral("   \u2022   %1 MB/s").arg(QString::number(speed / 1048576.0, 'f', 1));
++            if (total > 0 && done < total) {
++                detail += QStringLiteral("   \u2022   ostalo %1")
++                        .arg(fmtEta(static_cast<qint64>((total - done) / static_cast<double>(speed))));
++            }
++        }
++        else if (finished) {
++            detail += QStringLiteral("   \u2022   gotovo");
++        }
++
++        RECT r{ rc.left + pad, rc.top + static_cast<int>(78 * s),
++                rc.right - pad, rc.top + static_cast<int>(98 * s) };
++        DrawTextW(dc, reinterpret_cast<const wchar_t*>(detail.utf16()), -1, &r,
++                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
++
++        SelectObject(dc, old);
++        DeleteObject(font);
++    }
++}
++
++LRESULT CALLBACK progressProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
++{
++    switch (msg) {
++    case kMsgRepaint:
++        InvalidateRect(hwnd, nullptr, FALSE);
++        return 0;
++
++    case kMsgShow:
++        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
++        InvalidateRect(hwnd, nullptr, FALSE);
++        return 0;
++
++    case kMsgHide:
++        ShowWindow(hwnd, SW_HIDE);
++        return 0;
++
++    case WM_ERASEBKGND:
++        return 1;   // the whole card is painted in WM_PAINT - no flicker
++
++    case WM_PAINT:
++    {
++        PAINTSTRUCT ps;
++        HDC dc = BeginPaint(hwnd, &ps);
++        drawCard(hwnd, dc);
++        EndPaint(hwnd, &ps);
++        return 0;
++    }
++
++    case WM_DESTROY:
++        PostQuitMessage(0);
++        return 0;
++    }
++
++    return DefWindowProcW(hwnd, msg, wp, lp);
++}
++
++void progressThread()
++{
++    WNDCLASSEXW wc{};
++    wc.cbSize = sizeof(wc);
++    wc.lpfnWndProc = progressProc;
++    wc.hInstance = GetModuleHandleW(nullptr);
++    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
++    wc.lpszClassName = L"LuxstreamProgressWnd";
++    RegisterClassExW(&wc);
++
++    const UINT dpi = GetDpiForSystem() != 0 ? GetDpiForSystem() : 96;
++    const double s = dpi / 96.0;
++    const int w = static_cast<int>(430 * s);
++    const int h = static_cast<int>(108 * s);
++
++    RECT work{};
++    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
++    const int x = work.right - w - static_cast<int>(16 * s);
++    const int y = work.bottom - h - static_cast<int>(16 * s);
++
++    // No caption and no activation: it is an indicator, not a window to work
++    // with, and it must never steal focus from the stream or the desktop.
++    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
++                                L"LuxstreamProgressWnd", L"Luxstream",
++                                WS_POPUP,
++                                x, y, w, h,
++                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
++    if (hwnd == nullptr) {
++        return;
++    }
++
++    g_pw.hwnd = hwnd;
++
++    MSG msg;
++    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
++        TranslateMessage(&msg);
++        DispatchMessageW(&msg);
++    }
++}
++
++void progressPoke(UINT msg)
++{
++    if (g_pw.hwnd != nullptr) {
++        PostMessageW(g_pw.hwnd, msg, 0, 0);
++    }
++}
++
++void luxProgressShow(const QString& title, const QString& name)
++{
++    {
++        std::lock_guard<std::mutex> lock(g_pw.textMutex);
++        g_pw.title = title;
++        g_pw.name = name;
++    }
++
++    if (!g_pw.started) {
++        g_pw.started = true;
++        g_pw.worker = std::thread(progressThread);
++        // The window has to exist before the first repaint can be posted, or
++        // the first update is silently dropped. Bounded, because a failure to
++        // create the window must not hold up the transfer.
++        for (int i = 0; i < 200 && g_pw.hwnd == nullptr; i++) {
++            Sleep(5);
++        }
++        g_pw.worker.detach();
++    }
++
++    if (g_pw.hwnd == nullptr) {
++        return;         // no window (headless?) - the transfer goes on regardless
++    }
++
++    progressPoke(kMsgShow);
++    g_pw.visible = true;
++}
++
++void luxProgressUpdate(qint64 total, qint64 done, qint64 speed, bool finished,
++                       const QString& name)
++{
++    if (g_pw.hwnd == nullptr || !g_pw.visible) {
++        return;
++    }
++
++    if (!name.isEmpty()) {
++        std::lock_guard<std::mutex> lock(g_pw.textMutex);
++        g_pw.name = name;
++    }
++
++    g_pw.total.store(total);
++    g_pw.done.store(done);
++    g_pw.speed.store(speed);
++    g_pw.finished.store(finished);
++    progressPoke(kMsgRepaint);
++}
++
++void luxProgressHide()
++{
++    if (g_pw.hwnd == nullptr) {
++        return;
++    }
++    progressPoke(kMsgHide);
++    g_pw.visible = false;
++}
++
++}   // namespace
++#else
++namespace {
++void luxProgressShow(const QString&, const QString&) {}
++void luxProgressUpdate(qint64, qint64, qint64, bool, const QString&) {}
++void luxProgressHide() {}
++}   // namespace
++#endif
++
++LuxBridge* LuxBridge::start()
++{
++    auto* bridge = new LuxBridge(qApp);
++
++    if (!bridge->begin()) {
++        delete bridge;
++        return nullptr;
++    }
++
++    return bridge;
++}
++
++LuxBridge::LuxBridge(QObject* parent)
++    : QObject(parent)
++{
++    const QString home = QDir::homePath();
++    m_DropDir = QDir::toNativeSeparators(home + "/Luxstream/Drop");
++    m_ReceivedDir = QDir::toNativeSeparators(home + "/Luxstream/Primljeno");
++    m_SentDir = QDir::toNativeSeparators(home + "/Luxstream/Poslano");
++    m_LogPath = QDir::toNativeSeparators(home + "/Luxstream/luxstream-bridge.log");
++
++    const QByteArray programData = qgetenv("ProgramData");
++    const QString base = programData.isEmpty() ? QStringLiteral("C:\\ProgramData")
++                                              : QString::fromLocal8Bit(programData);
++    m_ConfigPath = QDir::toNativeSeparators(base + "/Luxstream/bridge.json");
++}
++
++LuxBridge::~LuxBridge()
++{
++    m_PollTimer.stop();
++
++    for (auto it = m_Connections.begin(); it != m_Connections.end(); ++it) {
++        if (it.value()->rxActive) {
++            it.value()->rxFile.close();
++        }
++        if (it.value()->txActive) {
++            it.value()->txFile.close();
++        }
++        delete it.value();
++    }
++    m_Connections.clear();
++
++    delete m_Server;
++    m_Server = nullptr;
++}
++
++bool LuxBridge::isListening() const
++{
++    return m_Server != nullptr && m_Server->isListening();
++}
++
++void LuxBridge::ensureFolders()
++{
++    for (const QString& dir : { m_DropDir, m_ReceivedDir, m_SentDir }) {
++        QDir().mkpath(dir);
++    }
++}
++
++void LuxBridge::log(const QString& message)
++{
++    const QString line = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss") + QStringLiteral("  ") + message;
++
++    QFileInfo fi(m_LogPath);
++    if (fi.exists() && fi.size() > kLogMaxBytes) {
++        QFile::remove(m_LogPath + QStringLiteral(".1"));
++        QFile::rename(m_LogPath, m_LogPath + QStringLiteral(".1"));
++    }
++
++    QFile f(m_LogPath);
++    if (f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
++        f.write(line.toUtf8());
++        f.write("\r\n");
++        f.close();
++    }
++}
++
++bool LuxBridge::begin()
++{
++    ensureFolders();
++
++    QFile cfg(m_ConfigPath);
++    if (!cfg.exists()) {
++        log(QStringLiteral("most nije pokrenut: nema %1").arg(m_ConfigPath));
++        return false;
++    }
++
++    if (!cfg.open(QIODevice::ReadOnly)) {
++        log(QStringLiteral("most nije pokrenut: ne mogu citati %1").arg(m_ConfigPath));
++        return false;
++    }
++
++    const QJsonDocument doc = QJsonDocument::fromJson(cfg.readAll());
++    cfg.close();
++
++    if (!doc.isObject()) {
++        log(QStringLiteral("most nije pokrenut: %1 nije ispravan JSON").arg(m_ConfigPath));
++        return false;
++    }
++
++    const QJsonObject obj = doc.object();
++
++    m_Port = obj.value(QStringLiteral("port")).toInt(51888);
++    m_Secret = obj.value(QStringLiteral("secret")).toString();
++
++    m_AllowedClients.clear();
++    const QJsonValue allowed = obj.value(QStringLiteral("allowedClients"));
++    if (allowed.isArray()) {
++        for (const QJsonValue& v : allowed.toArray()) {
++            const QString prefix = v.toString();
++            if (!prefix.isEmpty()) {
++                m_AllowedClients.append(prefix);
++            }
++        }
++    }
++    if (m_AllowedClients.isEmpty()) {
++        m_AllowedClients = { QStringLiteral("172.29."), QStringLiteral("192.168."),
++                             QStringLiteral("10."), QStringLiteral("127.") };
++    }
++
++    // The shared secret is optional. It only stops accidental connections; the
++    // real gate is the address allow list above. With no secret configured the
++    // server accepts any greeting - which is what "no secret" has to mean, or a
++    // client that was never told the secret could never connect and the failure
++    // would look like "nothing happens" on both machines.
++    if (m_Secret.isEmpty()) {
++        log(QStringLiteral("most radi bez zajednicke tajne - provjerava se samo popis dopustenih adresa"));
++    }
++
++    if (m_Port <= 0 || m_Port > 65535) {
++        log(QStringLiteral("most nije pokrenut: neispravan port %1").arg(m_Port));
++        return false;
++    }
++
++    m_Server = new QTcpServer(this);
++    if (!m_Server->listen(QHostAddress::Any, static_cast<quint16>(m_Port))) {
++        log(QStringLiteral("most nije pokrenut: port %1 se ne moze otvoriti (%2)")
++                .arg(m_Port).arg(m_Server->errorString()));
++        delete m_Server;
++        m_Server = nullptr;
++        return false;
++    }
++
++    connect(m_Server, &QTcpServer::newConnection, this, &LuxBridge::onNewConnection);
++
++    m_PollTimer.setInterval(kPollMs);
++    m_PollTimer.setTimerType(Qt::CoarseTimer);
++    connect(&m_PollTimer, &QTimer::timeout, this, &LuxBridge::onPoll);
++    m_PollTimer.start();
++
++    log(QStringLiteral("posluzitelj pokrenut, port %1, dopusteni: %2")
++            .arg(m_Port).arg(m_AllowedClients.join(QLatin1Char(','))));
++    return true;
++}
++
++// The listener is dual stack (QHostAddress::Any), so on Windows an IPv4 client
++// arrives as an IPv4-mapped IPv6 address: "::ffff:127.0.0.1". Compared against a
++// list of IPv4 prefixes that never matches, and every connection is refused -
++// including the machine's own. The PowerShell half never hit this because it
++// used a plain IPv4 listener. Reduce the mapped form back to dotted IPv4 before
++// anything looks at it.
++QString LuxBridge::canonicalPeer(const QHostAddress& address)
++{
++    if (address.isNull()) {
++        return QStringLiteral("?");
++    }
++
++    // Qt prints IPv4-mapped addresses as "::ffff:a.b.c.d", which is not a valid
++    // IPv6 literal spelling but is what toString() hands back. Anything left of
++    // the last colon is the marker; the rest is the IPv4 address.
++    const QString text = address.toString();
++    if (text.startsWith(QStringLiteral("::ffff:"))) {
++        const QString ipv4 = text.mid(7);
++        if (!ipv4.isEmpty() && ipv4.at(0).isDigit()) {
++            return ipv4;
++        }
++    }
++
++    // Localhost over IPv6 is the same client as localhost over IPv4.
++    if (address.isLoopback() && address.protocol() == QAbstractSocket::IPv6Protocol) {
++        return QStringLiteral("127.0.0.1");
++    }
++
++    return text;
++}
++
++void LuxBridge::onNewConnection()
++{
++    while (m_Server != nullptr && m_Server->hasPendingConnections()) {
++        QTcpSocket* socket = m_Server->nextPendingConnection();
++
++        auto* conn = new Connection;
++        conn->socket = socket;
++        conn->peer = canonicalPeer(socket->peerAddress());
++
++        bool allowed = false;
++        for (const QString& prefix : m_AllowedClients) {
++            if (conn->peer.startsWith(prefix)) {
++                allowed = true;
++                break;
++            }
++        }
++
++        if (!allowed) {
++            // Refused before a single frame is read, exactly like the
++            // PowerShell half. The log line matters: a silent refusal here is
++            // indistinguishable from "the other side never tried".
++            log(QStringLiteral("ODBIJEN %1 (nije na popisu dopustenih)").arg(conn->peer));
++            socket->abort();
++            socket->deleteLater();
++            delete conn;
++            continue;
++        }
++
++        m_Connections.insert(socket, conn);
++        connect(socket, &QTcpSocket::readyRead, this, &LuxBridge::onReadyRead);
++        connect(socket, &QTcpSocket::bytesWritten, this, &LuxBridge::onBytesWritten);
++        connect(socket, &QTcpSocket::disconnected, this, &LuxBridge::onDisconnected);
++    }
++}
++
++void LuxBridge::onReadyRead()
++{
++    auto* socket = qobject_cast<QTcpSocket*>(sender());
++    if (socket == nullptr) {
++        return;
++    }
++
++    auto it = m_Connections.find(socket);
++    if (it == m_Connections.end()) {
++        return;
++    }
++
++    Connection* conn = it.value();
++    conn->buffer.append(socket->readAll());
++    processBuffer(conn);
++}
++
++void LuxBridge::onBytesWritten(qint64 bytes)
++{
++    auto* socket = qobject_cast<QTcpSocket*>(sender());
++    if (socket == nullptr) {
++        return;
++    }
++
++    auto it = m_Connections.find(socket);
++    if (it == m_Connections.end()) {
++        return;
++    }
++
++    Q_UNUSED(bytes);
++
++    // Bytes really left the socket, so this connection is alive. See
++    // checkStalls for what happens when this stamp stops moving.
++    it.value()->txProgressMs = QDateTime::currentMSecsSinceEpoch();
++
++    // The buffer has drained, so there is room for the next chunks. Without
++    // this the transfer would stop at the first high-water mark.
++    pumpSend(it.value());
++}
++
++void LuxBridge::onDisconnected()
++{
++    auto* socket = qobject_cast<QTcpSocket*>(sender());
++    if (socket == nullptr) {
++        return;
++    }
++
++    auto it = m_Connections.find(socket);
++    if (it == m_Connections.end()) {
++        return;
++    }
++
++    Connection* conn = it.value();
++
++    // A half-received file must not be left behind looking complete.
++    if (conn->rxActive) {
++        conn->rxFile.close();
++        log(QStringLiteral("  [!] veza prekinuta usred datoteke %1 - ostaje na disku")
++                .arg(QFileInfo(conn->rxPath).fileName()));
++    }
++
++    // What never went out has to be forgettable, or it would be dropped for
++    // good: a queued Drop file is already marked as sent, so losing the queue
++    // without handing the mark back means that file is never tried again.
++    if (conn->txActive) {
++        conn->txFile.close();
++        conn->txActive = false;
++        if (!conn->txCurrent.dropKey.isEmpty()) {
++            m_SentDropKeys.remove(conn->txCurrent.dropKey);
++        }
++        log(QStringLiteral("  [!] veza prekinuta usred slanja %1").arg(conn->txCurrent.name));
++    }
++    while (!conn->txQueue.isEmpty()) {
++        const TxItem item = conn->txQueue.dequeue();
++        if (!item.dropKey.isEmpty()) {
++            m_SentDropKeys.remove(item.dropKey);
++        }
++    }
++    // Queued for a move but not moved: the file is still in Drop\, so it has to
++    // stay on the list of things still to send.
++    for (const TxItem& item : conn->txMoves) {
++        if (!item.dropKey.isEmpty()) {
++            m_SentDropKeys.remove(item.dropKey);
++        }
++    }
++    conn->txMoves.clear();
++    conn->txBusy = false;
++
++    if (!conn->rejected) {
++        log(QStringLiteral("veza s %1 zatvorena").arg(conn->peer));
++    }
++
++    m_Connections.erase(it);
++    socket->deleteLater();
++    delete conn;
++
++    // Nothing can move any more, so a transfer that was on screen has to be
++    // taken down instead of sitting at its last percentage forever.
++    if (m_Connections.isEmpty() && m_Job.active) {
++        jobFinish();
++    }
++}
++
++void LuxBridge::dropStalePeers(Connection* keep)
++{
++    if (keep == nullptr) {
++        return;
++    }
++
++    // Collected first, hung up second: abort() can emit disconnected, which
++    // erases the entry from m_Connections and deletes the Connection, and
++    // doing that while iterating over the map it lives in is a use-after-free.
++    QVector<QTcpSocket*> stale;
++    for (auto it = m_Connections.constBegin(); it != m_Connections.constEnd(); ++it) {
++        Connection* other = it.value();
++        if (other == keep || !other->greeted || other->peer != keep->peer) {
++            continue;
++        }
++        stale.append(other->socket);
++    }
++
++    if (stale.isEmpty()) {
++        return;
++    }
++
++    log(QStringLiteral("  [!] %1 se ponovno spojio - zatvaram %2 stariju vezu")
++            .arg(keep->peer).arg(stale.size()));
++
++    for (QTcpSocket* socket : stale) {
++        auto it = m_Connections.find(socket);
++        if (it == m_Connections.end()) {
++            continue;
++        }
++        if (it.value()->rxActive) {
++            it.value()->rxFile.close();
++            it.value()->rxActive = false;
++        }
++        // Marked as a deliberate hang-up so the log does not also report it as
++        // an unexpected "veza zatvorena" right after the line above.
++        it.value()->rejected = true;
++        socket->abort();
++    }
++}
++
++void LuxBridge::checkStalls()
++{
++    const qint64 now = QDateTime::currentMSecsSinceEpoch();
++
++    QVector<QTcpSocket*> dead;
++    for (auto it = m_Connections.constBegin(); it != m_Connections.constEnd(); ++it) {
++        Connection* conn = it.value();
++        if (!conn->greeted) {
++            continue;
++        }
++
++        // A pause the far side asked for is not a stall. Without the txHeld
++        // test the 20 s rule below would abort every held transfer, and the
++        // hold would be useless for anything but a paste made within 20 s.
++        const bool busyTx = (conn->txActive || !conn->txQueue.isEmpty()) && !conn->txHeld;
++        if (busyTx && conn->txProgressMs != 0 && now - conn->txProgressMs > kStallTimeoutMs) {
++            log(QStringLiteral("  [!] %1: nista nije otislo %2 s - veza je mrtva, prekidam")
++                    .arg(conn->peer).arg(kStallTimeoutMs / 1000));
++            dead.append(conn->socket);
++            continue;
++        }
++
++        // Backstop for a pause that never ends: the other side gives up on its
++        // own after 10 minutes and continues the transfer normally, so reaching
++        // this means it died mid-pause without closing the socket.
++        if (conn->txHeld && conn->txHeldMs != 0 && now - conn->txHeldMs > kHoldTimeoutMs) {
++            log(QStringLiteral("  [!] %1: pauza traje duze od %2 min - prekidam")
++                    .arg(conn->peer).arg(kHoldTimeoutMs / 60000));
++            dead.append(conn->socket);
++            continue;
++        }
++
++        if (conn->rxActive && conn->rxProgressMs != 0 && now - conn->rxProgressMs > kStallTimeoutMs) {
++            if (conn->rxFile.isOpen()) {
++                conn->rxFile.close();
++            }
++            conn->rxActive = false;
++            conn->groupActive = false;
++            conn->groupPaths.clear();
++            log(QStringLiteral("  [!] %1: nista nije primljeno %2 s - veza je mrtva, prekidam")
++                    .arg(conn->peer).arg(kStallTimeoutMs / 1000));
++            dead.append(conn->socket);
++        }
++    }
++
++    for (QTcpSocket* socket : dead) {
++        auto it = m_Connections.find(socket);
++        if (it == m_Connections.end()) {
++            continue;
++        }
++        // The reason is already in the log; abort brings onDisconnected, which
++        // hands queued Drop files back so they are tried again after the
++        // reconnect instead of being lost.
++        if (it.value()->txActive) {
++            it.value()->txFile.close();
++            it.value()->txActive = false;
++        }
++        it.value()->txHeld = false;
++        it.value()->txHeldMs = 0;
++        it.value()->rejected = true;
++        socket->abort();
++    }
++}
++
++void LuxBridge::processBuffer(Connection* conn)
++{
++    while (conn->buffer.size() >= 5) {
++        const quint8 type = static_cast<quint8>(conn->buffer.at(0));
++        const qint32 len = qFromLittleEndian<qint32>(reinterpret_cast<const void*>(conn->buffer.constData() + 1));
++
++        if (len < 0 || len > kMaxFrameBytes) {
++            log(QStringLiteral("  [!] neispravna duljina okvira %1 od %2").arg(len).arg(conn->peer));
++            conn->socket->abort();
++            return;
++        }
++
++        if (conn->buffer.size() < 5 + len) {
++            return;     // wait for the rest
++        }
++
++        const QByteArray payload = conn->buffer.mid(5, len);
++        conn->buffer.remove(0, 5 + len);
++
++        if (!handleFrame(conn, type, payload)) {
++            return;
++        }
++    }
++}
++
++bool LuxBridge::handleFrame(Connection* conn, quint8 type, const QByteArray& payload)
++{
++    if (!conn->greeted) {
++        if (type != kFrameGreeting) {
++            log(QStringLiteral("ODBIJEN %1 - prvi okvir nije pozdrav (%2)").arg(conn->peer).arg(type));
++            conn->socket->abort();
++            return false;
++        }
++
++        const QJsonDocument doc = QJsonDocument::fromJson(payload);
++        const QString secret = doc.isObject() ? doc.object().value(QStringLiteral("secret")).toString()
++                                              : QString();
++
++        if (!m_Secret.isEmpty() && secret != m_Secret) {
++            log(QStringLiteral("ODBIJEN %1 - pogresna tajna").arg(conn->peer));
++            sendFrame(conn, kFrameGreetingReply, QByteArrayLiteral("NO"));
++            conn->socket->flush();
++            conn->rejected = true;
++            conn->socket->disconnectFromHost();
++            return false;
++        }
++
++        sendFrame(conn, kFrameGreetingReply, QByteArrayLiteral("OK"));
++        conn->greeted = true;
++        log(QStringLiteral("spojen %1").arg(conn->peer));
++
++        // The client reconnects after a link blip. Whatever it left behind is
++        // still listed here as connected (no FIN ever arrives - see
++        // checkStalls), and two connections to one machine would make
++        // firstLiveConnection() a coin toss.
++        dropStalePeers(conn);
++
++        // Whatever is in the clipboard right now becomes the baseline, so the
++        // first poll does not immediately push a stale copy at the other side.
++        rememberCurrentClipboard();
++        return true;
++    }
++
++    switch (type) {
++    case kFrameText:
++    {
++        if (payload.size() > kMaxTextBytes) {
++            log(QStringLiteral("  [!] tekst prevelik (%1 B)").arg(payload.size()));
++            break;
++        }
++
++        const QString text = QString::fromUtf8(payload);
++        if (!text.isEmpty()) {
++            applyClipboard(text, QByteArray(), QStringList());
++            QString preview = text.left(40);
++            if (text.length() > 40) {
++                preview += QStringLiteral("...");
++            }
++            preview.replace(QLatin1Char('\r'), QLatin1Char(' '));
++            preview.replace(QLatin1Char('\n'), QLatin1Char(' '));
++            log(QStringLiteral("  <- tekst %1 B  %2").arg(payload.size()).arg(preview));
++            rememberCurrentClipboard();
++        }
++        break;
++    }
++
++    case kFrameImage:
++    {
++        if (payload.size() > kMaxImageBytes) {
++            log(QStringLiteral("  [!] slika prevelika (%1 B)").arg(payload.size()));
++            break;
++        }
++
++        applyClipboard(QString(), payload, QStringList());
++        log(QStringLiteral("  <- slika %1 B").arg(payload.size()));
++        rememberCurrentClipboard();
++        break;
++    }
++
++    case kFrameClipGroup:
++    {
++        const QJsonDocument doc = QJsonDocument::fromJson(payload);
++        const int count = doc.isObject() ? doc.object().value(QStringLiteral("count")).toInt() : 0;
++        const qint64 total = doc.isObject() ? static_cast<qint64>(doc.object().value(QStringLiteral("ukupno")).toDouble()) : 0;
++        conn->groupActive = true;
++        conn->groupRemaining = count;
++        conn->groupPaths.clear();
++        log(QStringLiteral("  <- najava grupe: %1 datoteka, %2 MB")
++                .arg(count).arg(QString::number(total / 1048576.0, 'f', 1)));
++
++        // The announce already knows the whole group, so the bar can start
++        // there instead of crawling up one file header at a time.
++        jobStart(false, QStringLiteral("%1 datoteka").arg(count), total);
++        break;
++    }
++
++    case kFrameFileHeader:
++    {
++        const QJsonDocument doc = QJsonDocument::fromJson(payload);
++        if (!doc.isObject()) {
++            log(QStringLiteral("  [!] najava datoteke nije JSON"));
++            break;
++        }
++
++        const QString name = sanitizeName(doc.object().value(QStringLiteral("name")).toString());
++        const QString rel = doc.object().value(QStringLiteral("rel")).toString();
++        const qint64 declared = static_cast<qint64>(doc.object().value(QStringLiteral("size")).toDouble());
++        const QString dest = rel.isEmpty() ? freeName(m_ReceivedDir, name)
++                                           : destForRel(rel, name);
++
++        // A group announce already owns the job and knows the total. A single
++        // file arriving on its own (a Drop push from the other side) has no
++        // announce, so its header starts the job and is its whole total.
++        if (!m_Job.active || m_Job.sending) {
++            jobStart(false, name, declared);
++        }
++        else if (m_Job.total <= 0) {
++            m_Job.total += declared;
++            m_Job.label = name;
++        }
++
++        conn->rxProgressMs = QDateTime::currentMSecsSinceEpoch();
++
++        conn->rxPath = dest;
++        conn->rxFile.setFileName(dest);
++        conn->rxGot = 0;
++
++        if (!conn->rxFile.open(QIODevice::WriteOnly)) {
++            log(QStringLiteral("  [!] ne mogu pisati %1").arg(dest));
++            conn->rxActive = false;
++
++            // The chunks that follow are still on the wire. Without a receiver
++            // they would be taken for "chunk without a file header", so the
++            // connection has to go.
++            conn->socket->abort();
++            return false;
++        }
++
++        conn->rxActive = true;
++
++        if (conn->groupActive) {
++            conn->groupPaths.append(dest);
++        }
++        break;
++    }
++
++    case kFrameFileChunk:
++    {
++        if (!conn->rxActive) {
++            log(QStringLiteral("  [!] komad bez najave datoteke"));
++            conn->socket->abort();
++            return false;
++        }
++
++        if (conn->rxFile.write(payload) != payload.size()) {
++            log(QStringLiteral("  [!] greska pri pisanju %1").arg(QFileInfo(conn->rxPath).fileName()));
++        }
++        conn->rxGot += payload.size();
++        conn->rxProgressMs = QDateTime::currentMSecsSinceEpoch();
++        jobAdvance(false, payload.size());
++        break;
++    }
++
++    case kFrameFileEnd:
++    {
++        if (conn->rxActive) {
++            if (conn->groupActive && conn->groupRemaining > 0) {
++                conn->groupRemaining--;
++            }
++            finishReceiving(conn);
++        }
++        break;
++    }
++
++    case kFrameHold:
++    {
++        // Nothing is on the wire any more, so the pause has nothing to stop -
++        // the whole file already went out. Only the tail of the job is owed
++        // (moving it out of Drop\, closing the bar), and skipping it here would
++        // leave both hanging until a resume that never comes.
++        if (!conn->txActive && conn->txQueue.isEmpty()) {
++            pumpSend(conn);
++            break;
++        }
++
++        // Logged once, not once per repeat: a peer that resends the hold must
++        // not fill the log.
++        if (!conn->txHeld) {
++            conn->txHeld = true;
++            conn->txHeldMs = QDateTime::currentMSecsSinceEpoch();
++
++            // The stamp is refreshed so the pause does not immediately look
++            // like a stall; checkStalls skips TX entirely while held anyway.
++            conn->txProgressMs = conn->txHeldMs;
++
++            QString koji = conn->txActive ? conn->txCurrent.name : QString();
++            if (koji.isEmpty()) {
++                const QJsonDocument doc = QJsonDocument::fromJson(payload);
++                koji = doc.isObject() ? doc.object().value(QStringLiteral("name")).toString() : QString();
++            }
++
++            // The bar is the only thing the user is looking at on this side,
++            // and it is what tells them to go and paste. Without the suffix a
++            // paused transfer and a wedged one look exactly the same.
++            if (m_Job.active && m_Job.sending) {
++                m_HoldLabelBase = m_Job.label;
++                m_Job.label = m_HoldLabelBase + QStringLiteral("  -  ceka se lijepljenje (Ctrl+V)");
++            }
++
++            log(QStringLiteral("  [.] %1: pauza - primalac ceka lijepljenje%2")
++                    .arg(conn->peer)
++                    .arg(koji.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(koji)));
++        }
++        break;
++    }
++
++    case kFrameResume:
++    {
++        if (conn->txHeld) {
++            conn->txHeld = false;
++            const qint64 cekalo = conn->txHeldMs == 0 ? 0
++                                                      : (QDateTime::currentMSecsSinceEpoch() - conn->txHeldMs) / 1000;
++            conn->txHeldMs = 0;
++            conn->txProgressMs = QDateTime::currentMSecsSinceEpoch();
++
++            if (!m_HoldLabelBase.isEmpty()) {
++                m_Job.label = m_HoldLabelBase;
++                m_HoldLabelBase.clear();
++            }
++
++            log(QStringLiteral("  [.] %1: nastavljam (%2 s pauze)").arg(conn->peer).arg(cekalo));
++
++            // The chunks that were only not fed because of the pause go out
++            // now. Without this the transfer would sit here until the next
++            // bytesWritten, and that never comes because nothing was written.
++            pumpSend(conn);
++        }
++        break;
++    }
++
++    default:
++        log(QStringLiteral("  [!] nepoznat tip okvira %1").arg(type));
++        break;
++    }
++
++    return true;
++}
++
++void LuxBridge::finishReceiving(Connection* conn)
++{
++    if (!conn->rxActive) {
++        return;
++    }
++
++    conn->rxFile.close();
++    conn->rxActive = false;
++
++    log(QStringLiteral("  <- datoteka %1  (%2 B)")
++            .arg(QFileInfo(conn->rxPath).fileName()).arg(conn->rxGot));
++
++    if (conn->groupActive && conn->groupRemaining <= 0) {
++        applyClipboard(QString(), QByteArray(), conn->groupPaths);
++        log(QStringLiteral("  <- u meduspremnik stavljeno %1 datoteka").arg(conn->groupPaths.size()));
++        rememberCurrentClipboard();
++
++        conn->groupActive = false;
++        conn->groupPaths.clear();
++        jobFinish();
++    }
++    else if (!conn->groupActive) {
++        // A single file with no group around it (a Drop push). Nothing else is
++        // coming, so the job ends with it.
++        jobFinish();
++    }
++}
++
++void LuxBridge::sendFrame(Connection* conn, quint8 type, const QByteArray& payload)
++{
++    if (conn == nullptr || conn->socket == nullptr || conn->socket->state() != QAbstractSocket::ConnectedState) {
++        return;
++    }
++
++    QByteArray header;
++    header.reserve(5);
++    header.append(static_cast<char>(type));
++
++    const qint32 len = static_cast<qint32>(payload.size());
++    char lenBytes[4];
++    qToLittleEndian<qint32>(len, lenBytes);
++    header.append(lenBytes, 4);
++
++    conn->socket->write(header);
++    if (!payload.isEmpty()) {
++        conn->socket->write(payload);
++    }
++}
++
++bool LuxBridge::queueFile(Connection* conn, TxItem item)
++{
++    if (conn == nullptr) {
++        return false;
++    }
++
++    const QFileInfo fi(item.path);
++    if (!fi.exists() || !fi.isFile()) {
++        log(QStringLiteral("  [!] %1: nema datoteke").arg(fi.fileName()));
++        return false;
++    }
++
++    if (kDropFileMaxBytes > 0 && fi.size() > kDropFileMaxBytes) {
++        log(QStringLiteral("  [!] %1: prevelika (%2 MB > %3 MB)")
++                .arg(fi.fileName())
++                .arg(QString::number(fi.size() / 1048576.0, 'f', 1))
++                .arg(kDropFileMaxBytes / 1048576));
++        return false;
++    }
++
++    item.name = fi.fileName();
++    item.size = fi.size();
++
++    // Everything queued while a transfer is already running is added to that
++    // same job, so a clipboard group and a Drop file that rides along end up on
++    // one progress bar instead of fighting over it.
++    if (m_Job.active) {
++        jobExtend(true, item.name, item.size);
++    }
++    else {
++        jobStart(true, item.name, item.size);
++    }
++
++    conn->txQueue.enqueue(item);
++
++    // The group counters are set by the caller, before the first file of the
++    // group is queued - see pollClipboard. Counting here would not work:
++    // pumpSend below sends a small file inside this same call, so a group
++    // counted file by file drops back to zero between them and every file
++    // gets its own summary line ("1 datoteka", "2 datoteka", ...) instead of
++    // one line for the whole group.
++
++    pumpSend(conn);
++    return true;
++}
++
++void LuxBridge::pumpSend(Connection* conn)
++{
++    if (conn == nullptr || conn->txBusy) {
++        return;
++    }
++
++    conn->txBusy = true;
++
++    // Held by the far side until its user pastes (kFrameHold). Filling the
++    // socket from here would push the file into the send buffer anyway, and a
++    // 4 MB head start is exactly what the hold frame exists to avoid - the file
++    // must not grow on the other side before the paste happens.
++    if (conn->txHeld) {
++        conn->txBusy = false;
++        return;
++    }
++
++    while (conn->socket != nullptr && conn->socket->state() == QAbstractSocket::ConnectedState) {
++        if (!conn->txActive) {
++            if (conn->txQueue.isEmpty()) {
++                break;
++            }
++
++            const TxItem item = conn->txQueue.dequeue();
++            conn->txCurrent = item;
++            conn->txSent = 0;
++
++            QJsonObject header;
++            header.insert(QStringLiteral("name"), item.name);
++            header.insert(QStringLiteral("size"), static_cast<double>(item.size));
++            if (!item.rel.isEmpty()) {
++                // Only sent for files that came out of a copied folder. An
++                // older peer simply ignores the extra key and lands them flat,
++                // which is the old behaviour rather than a failure.
++                header.insert(QStringLiteral("rel"), item.rel);
++            }
++            sendFrame(conn, kFrameFileHeader, QJsonDocument(header).toJson(QJsonDocument::Compact));
++
++            conn->txFile.setFileName(item.path);
++            if (!conn->txFile.open(QIODevice::ReadOnly)) {
++                log(QStringLiteral("  [!] %1: ne mogu citati").arg(item.name));
++                conn->txActive = false;
++                if (!item.dropKey.isEmpty()) {
++                    m_SentDropKeys.remove(item.dropKey);
++                }
++                // The header is already gone. Closing the connection is the
++                // only way the other side ever learns this file is not coming.
++                conn->socket->abort();
++                break;
++            }
++
++            conn->txActive = true;
++            conn->txProgressMs = QDateTime::currentMSecsSinceEpoch();
++        }
++
++        // Flow control: without it a multi-gigabyte file would pile up in Qt's
++        // write buffer and take the whole app down with it. Stopping here only
++        // stops *filling* the buffer - the event loop runs the whole time and
++        // bytesWritten brings us back for the next chunks. The old code called
++        // waitForBytesWritten(30000) here instead, which pumped socket events
++        // only and left the window and the clipboard poll frozen for as long as
++        // the transfer lasted.
++        if (conn->socket->bytesToWrite() >= kSendBufferHighWater) {
++            break;
++        }
++
++        const QByteArray chunk = conn->txFile.read(kChunkBytes);
++        if (chunk.isEmpty()) {
++            finishCurrentSend(conn);
++            continue;   // the next queued file, if there is one
++        }
++
++        sendFrame(conn, kFrameFileChunk, chunk);
++        conn->txSent += chunk.size();
++        conn->txProgressMs = QDateTime::currentMSecsSinceEpoch();
++        jobAdvance(true, chunk.size());
++    }
++
++    // A Drop file may only leave Drop\ once its tail has really gone out, not
++    // when the last chunk was merely handed to the socket. Everything queued
++    // and buffered is done, so the moves are safe now.
++    if (!conn->txActive && conn->txQueue.isEmpty() && !conn->txMoves.isEmpty()
++            && conn->socket != nullptr && conn->socket->bytesToWrite() == 0) {
++        for (const TxItem& item : conn->txMoves) {
++            if (!QFile::rename(item.path, item.moveAfterTo)) {
++                log(QStringLiteral("  [!] Drop: ne mogu premjestiti %1").arg(item.name));
++            }
++        }
++        conn->txMoves.clear();
++    }
++
++    // Nothing is queued and the socket buffer is empty, so this side is done
++    // with the transfer. That is the end of the job, whatever it was made of -
++    // one big file, a whole clipboard group, or a Drop file that rode along.
++    if (!conn->txActive && conn->txQueue.isEmpty() && m_Job.active && m_Job.sending
++            && conn->socket != nullptr && conn->socket->bytesToWrite() == 0) {
++        jobFinish();
++    }
++
++    conn->txBusy = false;
++}
++
++void LuxBridge::finishCurrentSend(Connection* conn)
++{
++    const TxItem item = conn->txCurrent;
++
++    sendFrame(conn, kFrameFileEnd, QByteArray());
++    conn->txFile.close();
++    conn->txActive = false;
++    conn->txCurrent = TxItem();
++
++    // A file that leaves Drop\ is a file that has been delivered; keeping it
++    // would mean sending it again after every restart. The move itself waits
++    // for the socket to drain - see pumpSend.
++    if (!item.moveAfterTo.isEmpty()) {
++        conn->txMoves.append(item);
++    }
++
++    if (item.fromClipboard) {
++        conn->grpLeft--;
++        if (conn->grpLeft <= 0) {
++            log(QStringLiteral("  -> u meduspremnik poslano %1 datoteka (%2 MB)")
++                    .arg(conn->grpCount)
++                    .arg(QString::number(conn->grpBytes / 1048576.0, 'f', 1)));
++        }
++    }
++}
++
++// A transfer "job" is whatever is on the wire right now, in one direction. It
++// is counted from the bytes that really move, so the window and the log never
++// disagree, and it is deliberately not tied to a clipboard group: a queued Drop
++// file rides along on the same job instead of resetting it.
++void LuxBridge::jobStart(bool sending, const QString& label, qint64 bytes)
++{
++    m_Job.active = true;
++    m_Job.sending = sending;
++    m_Job.label = label;
++    m_Job.total = bytes;
++    m_Job.done = 0;
++    m_Job.startMs = QDateTime::currentMSecsSinceEpoch();
++    m_Job.lastMs = m_Job.startMs;
++    m_Job.lastDone = 0;
++    m_Job.speed = 0;
++    m_Job.endMs = 0;
++    m_Job.lastPaintMs = 0;
++    m_Job.shown = false;
++}
++
++void LuxBridge::jobExtend(bool sending, const QString& label, qint64 bytes)
++{
++    // A transfer in the other direction owns the window; counting this one into
++    // it would make the numbers nonsense.
++    if (!m_Job.active || m_Job.sending != sending) {
++        return;
++    }
++
++    m_Job.total += bytes;
++    if (!label.isEmpty()) {
++        m_Job.label = label;
++    }
++}
++
++void LuxBridge::jobAdvance(bool sending, qint64 bytes)
++{
++    if (!m_Job.active || m_Job.endMs != 0 || m_Job.sending != sending) {
++        return;
++    }
++
++    m_Job.done += bytes;
++
++    const qint64 now = QDateTime::currentMSecsSinceEpoch();
++    if (now - m_Job.lastMs >= 400) {
++        const double dt = (now - m_Job.lastMs) / 1000.0;
++        if (dt > 0.0) {
++            m_Job.speed = static_cast<qint64>((m_Job.done - m_Job.lastDone) / dt);
++        }
++        m_Job.lastMs = now;
++        m_Job.lastDone = m_Job.done;
++    }
++
++    jobTick();
++}
++
++void LuxBridge::jobFinish()
++{
++    if (!m_Job.active) {
++        return;
++    }
++
++    // A job that was aborted while the far side held it would otherwise keep
++    // the "ceka se lijepljenje" hint on a bar that is already counting down.
++    if (!m_HoldLabelBase.isEmpty()) {
++        m_Job.label = m_HoldLabelBase;
++        m_HoldLabelBase.clear();
++    }
++
++    m_Job.active = false;
++    m_Job.endMs = QDateTime::currentMSecsSinceEpoch();
++    m_Job.lastPaintMs = 0;      // the final 100% is drawn immediately
++    jobTick();
++}
++
++void LuxBridge::jobTick()
++{
++    if (!m_Job.active && m_Job.endMs == 0) {
++        return;
++    }
++
++    const qint64 now = QDateTime::currentMSecsSinceEpoch();
++
++    if (m_Job.active) {
++        if (!m_Job.shown) {
++            // A copy that is over before the eye reaches it is not worth a
++            // window, so it only appears for a transfer of some size that is
++            // also still running after the delay.
++            if (m_Job.total < kProgressMinBytes || now - m_Job.startMs < kProgressShowDelayMs) {
++                return;
++            }
++            luxProgressShow(m_Job.sending ? QStringLiteral("Luxstream - saljem")
++                                          : QStringLiteral("Luxstream - primam"),
++                            m_Job.label);
++            m_Job.shown = true;
++            m_Job.lastPaintMs = 0;
++        }
++
++        if (now - m_Job.lastPaintMs < kProgressPaintMs) {
++            return;
++        }
++        m_Job.lastPaintMs = now;
++        luxProgressUpdate(m_Job.total, m_Job.done, m_Job.speed, false, m_Job.label);
++        return;
++    }
++
++    // Finished. The window stays up for a moment so the 100% is actually seen
++    // instead of vanishing the instant the last byte lands.
++    if (!m_Job.shown) {
++        m_Job.endMs = 0;
++        return;
++    }
++
++    if (now - m_Job.endMs < kProgressKeepMs) {
++        if (now - m_Job.lastPaintMs < kProgressPaintMs) {
++            return;
++        }
++        m_Job.lastPaintMs = now;
++        luxProgressUpdate(m_Job.total, m_Job.done, m_Job.speed, true, m_Job.label);
++        return;
++    }
++
++    luxProgressHide();
++    m_Job.shown = false;
++    m_Job.endMs = 0;
++}
++
++LuxBridge::Connection* LuxBridge::firstLiveConnection() const
++{
++    for (auto it = m_Connections.constBegin(); it != m_Connections.constEnd(); ++it) {
++        if (it.value()->greeted && it.value()->socket->state() == QAbstractSocket::ConnectedState) {
++            return it.value();
++        }
++    }
++    return nullptr;
++}
++
++void LuxBridge::onPoll()
++{
++    // Both of these have to run even with nothing connected: the first may
++    // discover that a connection only looks alive, the second still has to
++    // take the progress window down after a transfer that just ended.
++    checkStalls();
++    jobTick();
++
++    Connection* conn = firstLiveConnection();
++    if (conn == nullptr) {
++        return;
++    }
++
++    pollClipboard();
++    pollDropFolder();
++}
++
++LuxBridge::ClipKind LuxBridge::readClipboard(QString* text, QByteArray* png, QStringList* files) const
++{
++    const QClipboard* clipboard = QGuiApplication::clipboard();
++    const QMimeData* mime = clipboard != nullptr ? clipboard->mimeData() : nullptr;
++
++    if (mime != nullptr && mime->hasUrls()) {
++        QStringList local;
++        for (const QUrl& url : mime->urls()) {
++            if (!url.isLocalFile()) {
++                continue;
++            }
++            const QString path = url.toLocalFile();
++            QFileInfo fi(path);
++            // Folders are taken as well now. They are not sent as such - a
++            // folder is expanded later, in expandPaths, into the files it
++            // holds. Dropping them here is what made copying a folder look
++            // like nothing happened at all.
++            if (fi.exists()) {
++                local.append(QDir::toNativeSeparators(path));
++            }
++        }
++        if (!local.isEmpty()) {
++            if (files != nullptr) {
++                *files = local;
++            }
++            return ClipKind::Files;
++        }
++    }
++
++    if (mime != nullptr && mime->hasText()) {
++        const QString t = clipboard->text();
++        if (!t.isEmpty()) {
++            if (text != nullptr) {
++                *text = t;
++            }
++            return ClipKind::Text;
++        }
++    }
++
++    const QImage img = clipboard != nullptr ? clipboard->image() : QImage();
++    if (!img.isNull()) {
++        QByteArray data;
++        QBuffer buffer(&data);
++        buffer.open(QIODevice::WriteOnly);
++        if (img.save(&buffer, "PNG")) {
++            buffer.close();
++            if (png != nullptr) {
++                *png = data;
++            }
++            return ClipKind::Image;
++        }
++    }
++
++    return ClipKind::None;
++}
++
++void LuxBridge::applyClipboard(const QString& text, const QByteArray& png, const QStringList& files)
++{
++    QClipboard* clipboard = QGuiApplication::clipboard();
++    if (clipboard == nullptr) {
++        return;
++    }
++
++    // What this call intends to put on the clipboard. rememberCurrentClipboard
++    // re-reads instead of trusting this, because a PNG does not always come
++    // back byte-identical - but if the re-read comes back empty (another
++    // process held the clipboard) the hash below is what saves the bridge from
++    // taking the other side's own content for a fresh change and bouncing it
++    // straight back.
++    m_AppliedHash = hashOf(!files.isEmpty() ? ClipKind::Files
++                                            : (!png.isEmpty() ? ClipKind::Image
++                                                              : (!text.isEmpty() ? ClipKind::Text
++                                                                                 : ClipKind::None)),
++                           text, png, files);
++
++    if (!files.isEmpty()) {
++        QMimeData* mime = new QMimeData();
++        QList<QUrl> urls;
++        for (const QString& path : files) {
++            urls.append(QUrl::fromLocalFile(path));
++        }
++        mime->setUrls(urls);
++        clipboard->setMimeData(mime);
++        return;
++    }
++
++    if (!png.isEmpty()) {
++        const QImage img = QImage::fromData(png, "PNG");
++        if (!img.isNull()) {
++            clipboard->setImage(img);
++        }
++        return;
++    }
++
++    if (!text.isEmpty()) {
++        clipboard->setText(text);
++    }
++}
++
++QString LuxBridge::hashOf(ClipKind kind, const QString& text, const QByteArray& png,
++                          const QStringList& files) const
++{
++    switch (kind) {
++    case ClipKind::Text:
++        return QStringLiteral("T") + md5hex(text.toUtf8());
++    case ClipKind::Image:
++        return QStringLiteral("I") + md5hex(png.toBase64());
++    case ClipKind::Files:
++    {
++        QStringList sorted = files;
++        sorted.sort();
++        return QStringLiteral("F") + md5hex(sorted.join(QLatin1Char('|')).toUtf8());
++    }
++    default:
++        return QStringLiteral("N");
++    }
++}
++
++void LuxBridge::rememberCurrentClipboard()
++{
++    QString text;
++    QByteArray png;
++    QStringList files;
++    const ClipKind kind = readClipboard(&text, &png, &files);
++
++    const QString hash = hashOf(kind, text, png, files);
++
++    if (hash == QStringLiteral("N") && !m_AppliedHash.isEmpty()) {
++        // The clipboard did not hand back what was just put there. Storing "N"
++        // would leave m_LastHash describing nothing, so the next poll would
++        // read the other side's content, find it different, and send it back.
++        m_LastHash = m_AppliedHash;
++    }
++    else {
++        m_LastHash = hash;
++        m_AppliedHash = hash;
++    }
++
++    // One poll interval. The window only has to cover the clipboard settling
++    // after it was written; anything longer silently swallows copies the user
++    // makes in the meantime, and two copies inside it meant the first was never
++    // sent at all.
++    m_SkipUntilMs = QDateTime::currentMSecsSinceEpoch() + kPollMs;
++}
++
++void LuxBridge::pollClipboard()
++{
++    if (QDateTime::currentMSecsSinceEpoch() < m_SkipUntilMs) {
++        return;
++    }
++
++    QString text;
++    QByteArray png;
++    QStringList files;
++    const ClipKind kind = readClipboard(&text, &png, &files);
++
++    const QString hash = hashOf(kind, text, png, files);
++    if (hash == m_LastHash || hash == QStringLiteral("N")) {
++        return;
++    }
++
++    Connection* conn = firstLiveConnection();
++    if (conn == nullptr) {
++        return;
++    }
++
++    // While the far side waits for its user to paste, its clipboard holds the
++    // path we are about to fill - a text or image frame pushed now would wipe
++    // exactly the thing the user is about to paste. m_LastHash is deliberately
++    // NOT consumed here, so whatever was copied during the pause goes out on
++    // its own once the transfer resumes.
++    if (conn->txHeld) {
++        return;
++    }
++
++    switch (kind) {
++    case ClipKind::Text:
++        if (text.toUtf8().size() <= kMaxTextBytes) {
++            sendFrame(conn, kFrameText, text.toUtf8());
++            m_LastHash = hash;
++
++            QString preview = text.left(40);
++            if (text.length() > 40) {
++                preview += QStringLiteral("...");
++            }
++            preview.replace(QLatin1Char('\r'), QLatin1Char(' '));
++            preview.replace(QLatin1Char('\n'), QLatin1Char(' '));
++            log(QStringLiteral("  -> tekst %1 B  %2").arg(text.toUtf8().size()).arg(preview));
++        }
++        break;
++
++    case ClipKind::Image:
++        if (png.size() <= kMaxImageBytes) {
++            sendFrame(conn, kFrameImage, png);
++            m_LastHash = hash;
++            log(QStringLiteral("  -> slika %1 B").arg(png.size()));
++        }
++        break;
++
++    case ClipKind::Files:
++    {
++        // The clipboard may hold folders as well as files; only the expanded
++        // list is what actually travels.
++        const QVector<QPair<QString, QString>> items = expandPaths(files);
++
++        qint64 total = 0;
++        for (const QPair<QString, QString>& e : items) {
++            total += QFileInfo(e.first).size();
++        }
++
++        m_LastHash = hash;
++
++        if (kClipFileMaxBytes <= 0 || total <= kClipFileMaxBytes) {
++            QJsonObject announce;
++            announce.insert(QStringLiteral("count"), items.size());
++            announce.insert(QStringLiteral("ukupno"), static_cast<double>(total));
++            sendFrame(conn, kFrameClipGroup, QJsonDocument(announce).toJson(QJsonDocument::Compact));
++
++            // The accounting is per group, and a group that is still on the wire
++            // is added to rather than replaced, so one summary line covers both.
++            // It has to be done BEFORE the first file is queued: queueFile sends
++            // a small file inside the same call, so a group counted file by file
++            // goes back to zero between them and every file would get its own
++            // summary line instead of one for the group.
++            if (conn->grpLeft <= 0) {
++                conn->grpCount = 0;
++                conn->grpBytes = 0;
++                conn->grpLeft = 0;
++            }
++
++            int spremno = 0;
++            qint64 spremnoBajtova = 0;
++            for (const QPair<QString, QString>& e : items) {
++                const QFileInfo fi(e.first);
++                if (fi.exists() && fi.isFile()) {
++                    spremno++;
++                    spremnoBajtova += fi.size();
++                }
++            }
++            conn->grpCount += spremno;
++            conn->grpLeft += spremno;
++            conn->grpBytes += spremnoBajtova;
++
++            int queued = 0;
++            for (const QPair<QString, QString>& e : items) {
++                TxItem item;
++                item.path = e.first;
++                item.rel = e.second;
++                item.fromClipboard = true;
++                if (queueFile(conn, item)) {
++                    queued++;
++                }
++            }
++
++            // A file that was counted but then refused (gone by the time we got
++            // to it, or over the cap) would otherwise hold grpLeft above zero
++            // and swallow the summary line of the whole group.
++            if (queued < spremno) {
++                conn->grpLeft -= (spremno - queued);
++                conn->grpCount -= (spremno - queued);
++            }
++
++            // The summary itself is written by finishCurrentSend, once the last
++            // file of the group has really gone out - a whole group of small
++            // files can even finish inside queueFile itself. Only the "nothing
++            // to send" case has no file to write it from.
++            if (queued == 0) {
++                log(QStringLiteral("  -> u meduspremnik poslano 0 datoteka (%1 MB)")
++                        .arg(QString::number(total / 1048576.0, 'f', 1)));
++            }
++        }
++        else {
++            log(QStringLiteral("  [!] kopirano %1 MB > %2 MB - preskacem; koristi mapu Drop")
++                    .arg(QString::number(total / 1048576.0, 'f', 1))
++                    .arg(kClipFileMaxBytes / 1048576));
++        }
++        break;
++    }
++
++    default:
++        break;
++    }
++}
++
++void LuxBridge::pollDropFolder()
++{
++    QDir dropDir(m_DropDir);
++    if (!dropDir.exists()) {
++        return;
++    }
++
++    const QFileInfoList entries = dropDir.entryInfoList(QDir::Files, QDir::Name);
++    if (entries.isEmpty()) {
++        return;
++    }
++
++    Connection* conn = firstLiveConnection();
++    if (conn == nullptr) {
++        return;
++    }
++
++    const QDateTime cutOff = QDateTime::currentDateTimeUtc().addSecs(-1);
++
++    for (const QFileInfo& fi : entries) {
++        const QString key = fi.fileName()
++                + QLatin1Char('|') + QString::number(fi.size())
++                + QLatin1Char('|') + QString::number(fi.lastModified().toUTC().toMSecsSinceEpoch());
++
++        if (m_SentDropKeys.contains(key)) {
++            continue;
++        }
++
++        // Still being copied in. Sending now would ship a truncated file.
++        if (fi.lastModified().toUTC() > cutOff) {
++            continue;
++        }
++
++        m_SentDropKeys.insert(key, true);
++
++        log(QStringLiteral("  -> Drop: %1 (%2 B)").arg(fi.fileName()).arg(fi.size()));
++
++        // The move to Poslano\ happens in finishCurrentSend, after the last
++        // chunk: the file may no longer leave Drop\ until it is really gone.
++        TxItem item;
++        item.path = fi.absoluteFilePath();
++        item.rel = fi.fileName();
++        item.moveAfterTo = reserveName(m_SentDir, fi.fileName());
++        item.dropKey = key;
++        queueFile(conn, item);
++    }
++}
++
++QVector<QPair<QString, QString>> LuxBridge::expandPaths(const QStringList& items)
++{
++    QVector<QPair<QString, QString>> out;
++    QSet<QString> seen;
++
++    for (const QString& item : items) {
++        const QFileInfo fi(item);
++        if (!fi.exists()) {
++            continue;
++        }
++
++        if (fi.isDir()) {
++            // A folder is walked recursively and its own name becomes the first
++            // path segment, so the other side rebuilds "<folder>\..." instead of
++            // spilling the contents loose. Junctions are skipped: Windows is
++            // full of them (every "Application Data" is one), and following them
++            // both duplicates files and can loop forever.
++            const QString root = fi.absoluteFilePath();
++            const QString base = fi.fileName();
++            QDirIterator it(root, QDir::Files | QDir::NoSymLinks, QDirIterator::Subdirectories);
++            while (it.hasNext()) {
++                it.next();
++                QString rel = base + QLatin1Char('/')
++                        + QDir(root).relativeFilePath(it.fileInfo().absoluteFilePath());
++                rel.replace(QLatin1Char('\\'), QLatin1Char('/'));
++                if (seen.contains(rel)) {
++                    continue;
++                }
++                seen.insert(rel);
++                out.append(qMakePair(it.fileInfo().absoluteFilePath(), rel));
++            }
++            continue;
++        }
++
++        const QString rel = fi.fileName();
++        if (seen.contains(rel)) {
++            continue;
++        }
++        seen.insert(rel);
++        out.append(qMakePair(fi.absoluteFilePath(), rel));
++    }
++
++    return out;
++}
++
++QString LuxBridge::destForRel(const QString& rel, const QString& fallbackName)
++{
++    QStringList segments;
++    const QStringList raw = rel.split(QLatin1Char('/'), Qt::SkipEmptyParts);
++    for (const QString& part : raw) {
++        // Each segment goes through the same sanitiser as a plain file name, so
++        // a hostile "..\..\Windows" cannot climb out of Primljeno\.
++        const QString cleaned = sanitizeName(part);
++        if (!cleaned.isEmpty()) {
++            segments.append(cleaned);
++        }
++    }
++
++    if (segments.isEmpty()) {
++        return freeName(m_ReceivedDir, sanitizeName(fallbackName));
++    }
++
++    QDir dir(m_ReceivedDir);
++    for (int i = 0; i + 1 < segments.size(); i++) {
++        if (!dir.mkpath(segments.at(i))) {
++            // Somewhere up the tree is not writable. Dropping the file flat
++            // loses the structure but not the file itself.
++            return freeName(m_ReceivedDir, sanitizeName(fallbackName));
++        }
++        dir.cd(segments.at(i));
++    }
++
++    return freeName(dir.absolutePath(), segments.last());
++}
++
++QString LuxBridge::sanitizeName(const QString& name)
++{
++    QString n = name;
++    if (n.trimmed().isEmpty()) {
++        return QStringLiteral("datoteka");
++    }
++
++    // Discard any path the other side may have sent
++    const int slash = qMax(n.lastIndexOf(QLatin1Char('/')), n.lastIndexOf(QLatin1Char('\\')));
++    if (slash >= 0) {
++        n = n.mid(slash + 1);
++    }
++
++    // Replace what Windows does not allow in a file name
++    QString out;
++    out.reserve(n.size());
++    for (const QChar c : n) {
++        const ushort u = c.unicode();
++        if (u < 0x20 || c == QLatin1Char('<') || c == QLatin1Char('>') || c == QLatin1Char(':') ||
++                c == QLatin1Char('"') || c == QLatin1Char('|') || c == QLatin1Char('?') || c == QLatin1Char('*')) {
++            out.append(QLatin1Char('_'));
++        }
++        else {
++            out.append(c);
++        }
++    }
++
++    while (!out.isEmpty() && (out.endsWith(QLatin1Char(' ')) || out.endsWith(QLatin1Char('.')))) {
++        out.chop(1);
++    }
++    while (!out.isEmpty() && out.startsWith(QLatin1Char(' '))) {
++        out.remove(0, 1);
++    }
++
++    if (out.isEmpty() || out == QStringLiteral(".") || out == QStringLiteral("..")) {
++        return QStringLiteral("datoteka");
++    }
++
++    if (out.length() > 180) {
++        out.truncate(180);
++    }
++
++    return out;
++}
++
++QString LuxBridge::freeName(const QString& dir, const QString& name)
++{
++    const QString path = QDir(dir).filePath(name);
++    if (!QFileInfo::exists(path)) {
++        return path;
++    }
++
++    const QFileInfo fi(name);
++    const QString base = fi.completeBaseName().isEmpty() ? name : fi.completeBaseName();
++    const QString suffix = fi.suffix().isEmpty() ? QString() : QStringLiteral(".") + fi.suffix();
++
++    for (int i = 1; i < 10000; i++) {
++        const QString candidate = QDir(dir).filePath(QStringLiteral("%1-%2%3").arg(base).arg(i).arg(suffix));
++        if (!QFileInfo::exists(candidate)) {
++            return candidate;
++        }
++    }
++
++    return QDir(dir).filePath(QDateTime::currentDateTime().toString("HHmmss") + QLatin1Char('-') + name);
++}
++
++QString LuxBridge::reserveName(const QString& dir, const QString& name)
++{
++    QString path = freeName(dir, name);
++
++    // freeName only knows what is already on the disk. A whole poll tick can
++    // now queue several files at once and none of them has been moved yet, so
++    // two of them would be handed the same destination and one would overwrite
++    // the other. m_ReservedDests remembers what is already promised.
++    const QFileInfo fi(name);
++    const QString base = fi.completeBaseName().isEmpty() ? name : fi.completeBaseName();
++    const QString suffix = fi.suffix().isEmpty() ? QString() : QStringLiteral(".") + fi.suffix();
++
++    for (int i = 1; m_ReservedDests.contains(path) && i < 10000; i++) {
++        path = QDir(dir).filePath(QStringLiteral("%1-%2%3").arg(base).arg(i).arg(suffix));
++    }
++
++    m_ReservedDests.insert(path);
++    return path;
++}
++
++QString LuxBridge::md5hex(const QByteArray& data)
++{
++    return QString::fromLatin1(QCryptographicHash::hash(data, QCryptographicHash::Md5).toHex());
++}
+diff --git a/app/backend/luxbridge.h b/app/backend/luxbridge.h
+new file mode 100644
+index 0000000..80c58f5
+--- /dev/null
++++ b/app/backend/luxbridge.h
+@@ -0,0 +1,361 @@
++#pragma once
++
++#include <QByteArray>
++#include <QFile>
++#include <QHash>
++#include <QObject>
++#include <QPair>
++#include <QQueue>
++#include <QSet>
++#include <QString>
++#include <QStringList>
++#include <QTimer>
++#include <QVector>
++
++QT_BEGIN_NAMESPACE
++class QHostAddress;
++class QTcpServer;
++class QTcpSocket;
++QT_END_NAMESPACE
++
++// Luxstream bridge: clipboard and file transfer between this machine and the
++// other half of the pair.
++//
++// Why it exists at all: Sunshine and Moonlight share neither the clipboard nor
++// files. That is not a missing setting - the streaming protocol has no such
++// feature (Sunshine carries only video, audio and input). The bridge therefore
++// runs over plain TCP, entirely outside the stream protocol, so it keeps
++// working with any Sunshine and Moonlight version.
++//
++// This side is the SERVER. The reason is the address: on the Default Switch the
++// host keeps a fixed address while the VM's address changes (DHCP, clones), so
++// a client in the VM would otherwise have to be reconfigured. The other half is
++// luxstream-bridge.ps1 -Mode Client, which without -Peer picks the default
++// gateway - and on the Default Switch that gateway is exactly this machine.
++//
++// Because this lives inside Moonlight instead of in a scheduled task, the
++// clipboard is reached through Qt on the main thread. That removes the whole
++// reason the PowerShell half needed a permanent STA runspace: the Windows
++// clipboard API silently does nothing from an MTA thread, so a naive bridge
++// works when started by hand and stops working when started by Task Scheduler.
++//
++// Port 51888, config C:\ProgramData\Luxstream\bridge.json, log in
++// %USERPROFILE%\Luxstream\luxstream-bridge.log, folders Drop\ and Primljeno\.
++//
++// The wire format matches luxstream-bridge.ps1 exactly:
++//   [1 byte type][4 byte little-endian payload length][payload]
++//     0x01 greeting (JSON {v,secret})   0x02 greeting reply ("OK"/"NO")
++//     0x10 clipboard text (UTF-8)       0x11 clipboard image (PNG)
++//     0x12 clipboard file group (JSON {count,ukupno})
++//     0x20 file header (JSON {name,size,rel?} - "rel" only when the file came
++//          out of a copied folder, so the same tree can be rebuilt)
++//     0x21 file chunk                   0x22 file end
++//     0x30 hold   (JSON {name,size})    0x31 resume
++//          Receiver to sender. 0x30 says "stop sending me this file, my user
++//          has not pasted yet", 0x31 says "go on". Both are ignored by an
++//          older peer, which simply keeps streaming.
++class LuxBridge : public QObject
++{
++    Q_OBJECT
++
++public:
++    // Reads the configuration and starts listening. Returns nullptr when there
++    // is nothing to start with (no config, no secret, port taken) - in that
++    // case the reason is written to the bridge log.
++    static LuxBridge* start();
++
++    ~LuxBridge() override;
++
++    bool isListening() const;
++
++    // The listener is dual stack, so an IPv4 client arrives as an IPv4-mapped
++    // IPv6 address ("::ffff:127.0.0.1") that matches none of the IPv4 prefixes
++    // in the allow list. This reduces it back to dotted IPv4 before anything
++    // looks at it. Public only so the smoke test can reason about it.
++    static QString canonicalPeer(const QHostAddress& address);
++
++private slots:
++    void onNewConnection();
++    void onReadyRead();
++    void onBytesWritten(qint64 bytes);
++    void onDisconnected();
++    void onPoll();
++
++private:
++    explicit LuxBridge(QObject* parent = nullptr);
++
++    bool begin();
++    void ensureFolders();
++    void log(const QString& message);
++
++    // One file waiting to go out. Sending used to be a plain loop on the GUI
++    // thread, so a single 4.6 GB file held Moonlight's event loop for around a
++    // hundred seconds: the window froze, and the clipboard poll - which shares
++    // that thread - never saw anything the user copied while it ran. The queue
++    // below is fed to the socket from bytesWritten instead; see pumpSend.
++    struct TxItem
++    {
++        QString path;
++        QString name;
++        QString rel;
++        qint64 size = 0;
++
++        // When not empty, the file is moved here once it has fully gone out.
++        // The Drop folder is the only user: there "sent" has to mean "may leave
++        // Drop\" as well, so the move cannot happen before the last chunk.
++        QString moveAfterTo;
++
++        // The Drop bookkeeping key, kept so it can be released again when a
++        // file never actually makes it out.
++        QString dropKey;
++
++        // Files that came out of a copied clipboard group are counted, so the
++        // group summary is logged once, when the last of them is on the wire.
++        bool fromClipboard = false;
++    };
++
++    struct Connection
++    {
++        QTcpSocket* socket = nullptr;
++        QByteArray buffer;
++        bool greeted = false;
++        QString peer;
++
++        // File currently being received
++        bool rxActive = false;
++        QFile rxFile;
++        qint64 rxGot = 0;
++        QString rxPath;
++
++        // Clipboard file group currently being received, if any
++        bool groupActive = false;
++        int groupRemaining = 0;
++        QStringList groupPaths;
++
++        // Set once we have replied "NO" and are about to hang up
++        bool rejected = false;
++
++        // Outgoing files, oldest first. txActive covers txCurrent: while it is
++        // set, txFile is open and chunks are still being fed to the socket.
++        QQueue<TxItem> txQueue;
++        TxItem txCurrent;
++        QFile txFile;
++        bool txActive = false;
++        qint64 txSent = 0;
++
++        // Guards pumpSend against re-entering itself through bytesWritten.
++        bool txBusy = false;
++
++        // Set while the far side has asked us to stop pushing the file that is
++        // currently on the wire (kFrameHold). It is waiting for its own user to
++        // paste, which can take minutes. While it is set nothing is fed to the
++        // socket in this direction and the stall detector leaves TX alone -
++        // otherwise a deliberate pause looks exactly like a dead link and the
++        // 20 s rule would abort it. See handleFrame and checkStalls.
++        bool txHeld = false;
++        qint64 txHeldMs = 0;
++
++        // Files whose chunks are all buffered but which may not be moved out of
++        // Drop\ yet - the socket still holds the tail of them.
++        QVector<TxItem> txMoves;
++
++        // Clipboard group accounting: grpLeft counts the files still on the
++        // wire, so the "poslano N datoteka" line appears exactly once per group
++        // instead of once per file.
++        int grpLeft = 0;
++        int grpCount = 0;
++        qint64 grpBytes = 0;
++
++        // When the last byte really moved on this socket, in each direction.
++        // A link that dies quietly (a route disappears, the far side is killed)
++        // leaves the socket in ConnectedState for hours - Windows keepalive is
++        // off by default, so nothing ever reports the loss. Without these two
++        // stamps a transfer would sit there holding a socket that goes nowhere,
++        // and the only symptom would be "nothing happens". See checkStalls.
++        qint64 txProgressMs = 0;
++        qint64 rxProgressMs = 0;
++    };
++
++    void processBuffer(Connection* conn);
++    bool handleFrame(Connection* conn, quint8 type, const QByteArray& payload);
++    void finishReceiving(Connection* conn);
++
++    void sendFrame(Connection* conn, quint8 type, const QByteArray& payload);
++
++    // Queues a file for the other side. Returns false, and queues nothing, when
++    // the file is gone or over the size policy - the same verdict the old
++    // synchronous sender handed back. Name and size are filled in here, so a
++    // caller only has to say where the file is and what to do once it is out.
++    bool queueFile(Connection* conn, TxItem item);
++
++    // Fills the socket's write buffer from the queue until the high-water mark
++    // is reached, then returns to the event loop; the rest is driven by
++    // onBytesWritten. This is what replaced waitForBytesWritten - that call
++    // re-entered the event loop for socket traffic only, so the window and the
++    // clipboard poll stood still for as long as the transfer lasted.
++    void pumpSend(Connection* conn);
++
++    // Ends the file currently on the wire: end frame, close, move-if-Drop.
++    void finishCurrentSend(Connection* conn);
++
++    void pollClipboard();
++    void pollDropFolder();
++
++    // Aborts a connection whose socket has stopped moving bytes in either
++    // direction. This is the host-side counterpart of Test-Veza in the
++    // PowerShell half: there, a closed socket stayed "Connected"; here, a
++    // socket whose far end vanished stays "Connected" because no FIN ever
++    // arrives. Both have to be noticed by hand or the pair wedges.
++    void checkStalls();
++
++    // Hangs up any older, still-listed connection from the same peer. The
++    // client reconnects after a link blip, and the stale socket it left behind
++    // is never reported as closed - so the bridge would end up holding two
++    // connections to one machine and firstLiveConnection() would pick between
++    // them at random. The newest one is the one that works.
++    void dropStalePeers(Connection* keep);
++
++    Connection* firstLiveConnection() const;
++
++    // What the progress window is currently showing. Bytes are counted as they
++    // really move, so the window and the log tell the same story. Only one
++    // transfer is on screen at a time; whatever starts last owns it.
++    struct Job
++    {
++        bool active = false;
++        bool sending = true;
++        QString label;
++        qint64 total = 0;
++        qint64 done = 0;
++        qint64 startMs = 0;
++        qint64 lastMs = 0;
++        qint64 lastDone = 0;
++        qint64 speed = 0;         // bytes per second, smoothed over ~0.5 s
++        qint64 endMs = 0;         // when it ended, while the window is still up
++        qint64 lastPaintMs = 0;
++        bool shown = false;
++    };
++
++    void jobStart(bool sending, const QString& label, qint64 bytes);
++    void jobExtend(bool sending, const QString& label, qint64 bytes);
++    void jobAdvance(bool sending, qint64 bytes);
++    void jobFinish();
++    void jobTick();
++
++    static QString sanitizeName(const QString& name);
++    static QString freeName(const QString& dir, const QString& name);
++    static QString md5hex(const QByteArray& data);
++
++    // freeName plus the names already promised to a queued file. A single poll
++    // tick of pollDropFolder can now queue several files, and none of them has
++    // reached the disk yet, so the on-disk check alone cannot tell them apart -
++    // two of them would be handed the same destination.
++    QString reserveName(const QString& dir, const QString& name);
++
++    // Expands what was on the clipboard (files AND folders) into the files that
++    // actually go on the wire, each with the relative path the other side needs
++    // to rebuild the tree. A folder is walked recursively and its own name
++    // becomes the first path segment.
++    static QVector<QPair<QString, QString>> expandPaths(const QStringList& items);
++
++    // Where an incoming file lands. With "rel" the path is rebuilt under
++    // Primljeno\, creating folders on the way; without it the file goes flat
++    // into Primljeno\ as before, with the usual collision suffix.
++    QString destForRel(const QString& rel, const QString& fallbackName);
++
++    // Mirrors the PowerShell half, which reads all three kinds in one pass and
++    // in a deliberate order: files first, then text, then image. Copying a file
++    // in Explorer sets CF_HDROP but usually also CF_UNICODETEXT holding the
++    // path, so text-first would ship the path and never the file.
++    enum class ClipKind { None, Text, Image, Files };
++
++    ClipKind readClipboard(QString* text, QByteArray* png, QStringList* files) const;
++    void applyClipboard(const QString& text, const QByteArray& png, const QStringList& files);
++    void rememberCurrentClipboard();
++    QString hashOf(ClipKind kind, const QString& text, const QByteArray& png,
++                   const QStringList& files) const;
++
++    int m_Port = 51888;
++    QString m_Secret;
++    QStringList m_AllowedClients;
++    QString m_ConfigPath;
++    QString m_LogPath;
++    QString m_DropDir;
++    QString m_ReceivedDir;
++    QString m_SentDir;
++
++    // Hash of the clipboard content we already know about, so a change we made
++    // ourselves is not immediately sent back to the other side.
++    QString m_LastHash = QStringLiteral("N");
++
++    // What applyClipboard() last put on the clipboard. The re-read that follows
++    // it can come back empty when another process holds the clipboard, and
++    // without this the bridge would take the other side's own content for a
++    // fresh change and bounce it straight back.
++    QString m_AppliedHash;
++
++    // After the clipboard is set from the network it must be re-read and
++    // remembered. Re-reading (rather than reusing the hash we received) also
++    // covers the case where a re-encoded PNG does not come back byte-identical.
++    // The window is one poll interval: it only has to cover that settling, and
++    // every millisecond beyond it hides copies the user makes in the meantime -
++    // two copies inside the window used to mean the first one was never sent.
++    qint64 m_SkipUntilMs = 0;
++
++    QHash<QTcpSocket*, Connection*> m_Connections;
++    QTcpServer* m_Server = nullptr;
++    QTimer m_PollTimer;
++
++    // The job label as it was before a hold appended its hint to it, so the bar
++    // can go back to the plain file name once the paste has happened.
++    QString m_HoldLabelBase;
++
++    // What has already left Drop\, keyed by name|size|mtime so a file that is
++    // still being copied in is not sent half-way.
++    QHash<QString, bool> m_SentDropKeys;
++
++    // Destinations already promised to a file that is queued but not yet moved.
++    QSet<QString> m_ReservedDests;
++
++    Job m_Job;
++
++    static constexpr int kPollMs = 400;
++    static constexpr int kChunkBytes = 256 * 1024;
++    static constexpr int kLogMaxBytes = 2 * 1024 * 1024;
++    static constexpr qint64 kMaxTextBytes = 1024 * 1024;
++    static constexpr qint64 kMaxImageBytes = 16 * 1024 * 1024;
++    static constexpr qint64 kMaxFrameBytes = 64 * 1024 * 1024;
++    // 0 znaci "bez gornje granice" i to je zadano. Datoteka se salje u
++    // komadima od kChunkBytes, a druga strana svaki komad odmah zapisuje na
++    // disk - velicina datoteke zato ne odreduje ni potrosnju memorije ni
++    // velicinu pojedinog okvira. Granica velicine je bila samo politika, ne
++    // tehnicka nuznost, pa je nema. Postavi na >0 da je vratis.
++    static constexpr qint64 kClipFileMaxBytes = 0;
++    static constexpr qint64 kDropFileMaxBytes = 0;
++    static constexpr qint64 kSendBufferHighWater = 4 * 1024 * 1024;
++
++    // The progress window is not worth a window for a copy that is over before
++    // the eye reaches it, so it only appears for transfers of some size that
++    // are also still running after kProgressShowDelayMs. After the transfer
++    // ends the window stays up for kProgressKeepMs so the 100% is seen.
++    static constexpr qint64 kProgressMinBytes = 2 * 1024 * 1024;
++    static constexpr qint64 kProgressShowDelayMs = 600;
++    static constexpr qint64 kProgressKeepMs = 1200;
++
++    // How often the window is redrawn. Chunks arrive every few milliseconds, so
++    // without a limit this would repaint hundreds of times a second for a
++    // number nobody can read that fast.
++    static constexpr qint64 kProgressPaintMs = 200;
++
++    // No byte in either direction for this long, while something is in flight,
++    // means the socket is dead. 20 s sits far above anything a working link
++    // does (the slowest measured transfer here was ~34 MB/s) and far below the
++    // hours it takes Windows to give up on its own.
++    static constexpr qint64 kStallTimeoutMs = 20000;
++
++    // How long a peer may hold a transfer while its user pastes. The other side
++    // gives up on its own sooner (LazyCekajSec, 10 min) and falls back to a
++    // normal transfer, so this is only the backstop for a peer that vanished
++    // mid-pause without closing the socket.
++    static constexpr qint64 kHoldTimeoutMs = 15 * 60 * 1000;
++};
+diff --git a/app/main.cpp b/app/main.cpp
+index 6629a75..d4f466e 100644
+--- a/app/main.cpp
++++ b/app/main.cpp
+@@ -50,6 +50,7 @@
+ #include "gui/appmodel.h"
+ #include "backend/autoupdatechecker.h"
+ #include "backend/computermanager.h"
++#include "backend/luxbridge.h"
+ #include "backend/systemproperties.h"
+ #include "streaming/session.h"
+ #include "settings/streamingpreferences.h"
+@@ -969,6 +970,19 @@ int main(int argc, char *argv[])
+                                                        return StreamingPreferences::get(qmlEngine);
+                                                    });
+ 
++    // Luxstream: bring up the clipboard/file-transfer bridge. Sunshine and
++    // Moonlight share neither the clipboard nor files, so this runs over plain
++    // TCP outside the streaming protocol. It starts listening only if it finds
++    // a configuration; when it does not, the reason lands in the bridge log and
++    // nothing else changes. The object is parented to the app and torn down
++    // with it, so the port is released on exit.
++    if (LuxBridge::start() == nullptr) {
++        qInfo() << "Luxstream bridge not started (see luxstream-bridge.log in the user profile)";
++    }
++    else {
++        qInfo() << "Luxstream bridge listening";
++    }
++
+     // Create the identity manager on the main thread
+     IdentityManager::get();
+ 
