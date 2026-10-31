@@ -384,8 +384,19 @@ $do = New-Object System.Windows.Forms.DataObject
 $do.SetData('FileDrop', $k)
 # Explorer uz popis datoteka uvijek salje i "Preferred DropEffect". Bez njega
 # ostaje samo jednostruki CF_HDROP, pa se Ctrl+V u Exploreru zna odbiti ili
-# zalijepiti kao tekst putanje umjesto kao datoteke. 1 = DROPEFFECT_COPY.
-$do.SetData('Preferred DropEffect', [byte[]](1,0,0,0))
+# zalijepiti kao tekst putanje umjesto kao datoteke.
+#
+# 2 = DROPEFFECT_MOVE, a NE 1 = DROPEFFECT_COPY. Primljeno je samo PRIVREMENO
+# odlagaliste: kad korisnik zalijepi datoteku na pravo mjesto (npr. na radnu
+# povrsinu), Explorer je tamo PREMJESTI i izbrise iz Primljenog. Time se
+# odlagaliste samo cisti i nista se ne drzi dvaput na disku - inace bi se za
+# svaki veliki ISO placalo duplo.
+#
+# Cijena, svjesno prihvacena: nakon uspjesnog lijepljenja datoteke vise nema u
+# meduspremniku, pa se isti meduspremnik NE moze zalijepiti dvaput. Zato se
+# Primljeno i ne prazni samo od sebe - datoteka ostaje tamo dok je korisnik ne
+# zalijepi (ili dok je rucno ne obrise).
+$do.SetData('Preferred DropEffect', [byte[]](2,0,0,0))
 [System.Windows.Forms.Clipboard]::SetDataObject($do, $true)
 ""
 '@ @{ P = $putanje }
