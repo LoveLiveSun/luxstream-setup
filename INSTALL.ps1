@@ -1054,8 +1054,9 @@ if ($prekoRdp) {
     Remove-Item $log -Force -ErrorAction SilentlyContinue
     # Skriveno - inace Sunshineov konzolni prozor dodje u prvi plan i prekrije nas,
     # pa korisnik vidi da se Sunshine dize ali ne vidi instalaciju.
-    # Vrati-Prozor se ovdje NE zove: konzolu dizemo poslije, u fazi 5, a poziv
-    # usred pokretanja Sunshinea je bio drugi kandidat za zaglavljivanje.
+    # Vrati-Prozor se ovdje NE zove: poziv usred pokretanja Sunshinea je bio
+    # drugi kandidat za zaglavljivanje, a i nema svrhe - konzola se digne
+    # odmah poslije petlje, kad je Sunshine vec ugasen.
     Start-Process $sxe -WorkingDirectory (Split-Path $sxe -Parent) -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
 
     $stao = [Diagnostics.Stopwatch]::StartNew()
@@ -1101,6 +1102,11 @@ if ($prekoRdp) {
     Remove-Item $log -Force -ErrorAction SilentlyContinue
     if (-not $guid -and $pokusaj -lt 2) { Inf '  Sunshine did not list the VDD display - trying once more' }
   }
+
+  # Sunshine je ugasen i dnevnik je procitan - tek sada vrati konzolu u prvi
+  # plan. Sunshine se pokrece skriveno, ali Qt zna ipak izbaciti svoj prozor
+  # preko naseg, pa je to razlog zasto je ovaj poziv uopce tu.
+  Vrati-Prozor
 }
 
 # max_bitrate je GORNJA GRANICA u kbps, ne ciljna vrijednost. Sunshine uvijek
