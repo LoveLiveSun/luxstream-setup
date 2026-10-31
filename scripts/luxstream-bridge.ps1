@@ -426,13 +426,38 @@ $do.SetData('Preferred DropEffect', $true, $ms)
   } catch { Log "  [!] ne mogu postaviti datoteke u meduspremnik: $($_.Exception.Message)"; return $false }
 }
 
-# Nakon sto se meduspremnik POSTAVI iz mreze, mora se ponovno procitati i
-# zapamtiti - inace bi ga lokalna anketa vidjela kao "novo" i poslala natrag.
-# Ponovno citanje (a ne prepisivanje poslanog hasha) pokriva i slucaj kad se
-# slika pri ponovnom kodiranju u PNG ne dobije bajt-identicna.
-function Zapamti-Trenutni {
-  $s = Dohvati-Meduspremnik
+# Nakon sto se meduspremnik POSTAVI iz mreze, mora se zapamtiti sto u njemu
+# sada stoji - inace bi ga lokalna anketa vidjela kao "novo" i poslala natrag.
+#
+# ZA DATOTEKE I TEKST SE NE CITA PONOVNO, nego se hash racuna iz onoga sto je
+# upravo poslano (Zapamti-Poznati). Razlog je konkretan, vidjen 31.10.2026.:
+# prije je odmah nakon SetDataObject slijedio STA krug Dohvati-Meduspremnik,
+# dakle OleGetClipboard() na ISTOJ STA dretvi koja je meduspremnik upravo
+# postavila (Invoke-Sta radi na jednoj, ponovno koristenoj dretvi). Kad se to
+# izvede u prvih nekoliko milisekundi, Explorerov PRVI Ctrl+V na radnoj
+# povrsini ne napravi nista, a DRUGI radi normalno - jer je meduspremnik tada
+# vec "sjeo". Kod datoteka i teksta ponovno citanje ionako ne donosi nista:
+# sadrzaj je identican onome koji smo poslali, pa je hash deterministicki.
+# Kod slike ponovno citanje OSTAJE - vidi Zapamti-Trenutni.
+#
+# Prozor se drzi duze (3 s, prije 1.5 s): dok on traje, Luxstream NE dira
+# meduspremnik, pa korisnikov prvi Ctrl+V sigurno dolazi na miran meduspremnik.
+function Zapamti-Poznati($s) {
   $script:ZadnjiHash = Prezivjeli-Hash $s
+  $script:PreskociDo = (Get-Date).AddSeconds(3)
+}
+
+# Slika: hash se MORA dobiti ponovnim citanjem, jer se PNG pri ponovnom
+# kodiranju ne dobije uvijek bajt-identican. Ako citanje vrati 'N' (drugi
+# proces je u meduvremenu drzao meduspremnik), NE pamti se 'N' - anketa bi
+# nakon isteka prozora nas sadrzaj vidjela kao nov i poslala ga natrag. Tada
+# se koristi hash onoga sto je poslano; isti obrazac kao m_AppliedHash u
+# luxbridge.cpp na hostu.
+function Zapamti-Trenutni([string]$poznati = '') {
+  $s = Dohvati-Meduspremnik
+  $h = Prezivjeli-Hash $s
+  if ($h -eq 'N' -and $poznati) { $h = $poznati }
+  $script:ZadnjiHash = $h
   $script:PreskociDo = (Get-Date).AddSeconds(1.5)
 }
 
@@ -685,7 +710,10 @@ function Zavrsi-Primanje($rx, $stream) {
   if ($rx.ClipGrupa -and $rx.Grupa -and $rx.Grupa.Preostalo -le 0) {
     if (Postavi-Datoteke $rx.Grupa.Putanje) {
       Log ("  <- u meduspremnik stavljeno {0} datoteka" -f $rx.Grupa.Putanje.Count)
-      Zapamti-Trenutni
+      # Hash se racuna iz poslanog popisa, a meduspremnik se NE cita ponovno -
+      # vidi Zapamti-Poznati. Time u prozoru prije korisnikovog Ctrl+V nema
+      # nijednog OleGetClipboard() poziva iz Luxstreama.
+      Zapamti-Poznati @{ Vrsta = 'files'; Datoteke = $rx.Grupa.Putanje }
     }
     $script:Grupa = $null
   }
@@ -1355,7 +1383,7 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
               if (Postavi-Tekst $t) {
                 $p = if ($t.Length -gt 40) { $t.Substring(0,40) + '...' } else { $t }
                 Log ("  <- tekst {0} B  {1}" -f $f.Payload.Length, ($p -replace '\r?\n',' '))
-                Zapamti-Trenutni
+                Zapamti-Poznati @{ Vrsta = 'text'; Tekst = $t }
               }
             }
           }
@@ -1363,7 +1391,9 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
             if ($f.Payload.Length -le $MaxImageBytes) {
               if (Postavi-Sliku $f.Payload) {
                 Log ("  <- slika {0} B" -f $f.Payload.Length)
-                Zapamti-Trenutni
+                # Slika zadrzava ponovno citanje, ali uz poznati hash kao
+                # rezervu ako citanje vrati 'N' - vidi Zapamti-Trenutni.
+                Zapamti-Trenutni ('I' + (Hash ([Convert]::ToBase64String($f.Payload))))
               }
             } else { Log ("  [!] slika prevelika ({0} B)" -f $f.Payload.Length) }
           }
