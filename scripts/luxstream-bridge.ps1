@@ -449,6 +449,28 @@ function Receive-Frame($stream) {
   @{ Tip = [byte]$tip; Payload = $pl }
 }
 
+# Je li veza jos ziva?
+#
+# $klijent.Connected je samo ZAPAMCENO stanje - kad druga strana posalje FIN,
+# .NET ga ne mijenja. I Receive-Frame se poziva samo kad je $stream.DataAvailable
+# istinit, a za zatvorenu vezu je on laz. Veza koja je umrla dok se nista nije
+# slalo zato se nikad ne primijeti: petlja se vrti u prazno, u log se ne pise
+# nista, i klijent ostaje "spojen" na mrtvu uticnicu dok se ne pokusa pisati -
+# a to se ne dogodi ako se u meduvremenu ne kopira nista NA TOJ strani. Tocno
+# tako je most ostao nijem 40 minuta nakon sto je Moonlight na hostu zatvoren.
+#
+# Poll(SelectRead) je ono sto se stvarno dogodilo na uticnici: citljiv bez
+# ijednog bajta znaci da je druga strana zatvorila vezu (ili ju je resetirala).
+function Test-Veza($klijent, $stream) {
+  try {
+    if (-not $klijent.Connected) { return $false }
+    if ($klijent.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead)) {
+      return $stream.DataAvailable
+    }
+    return $true
+  } catch { return $false }
+}
+
 function Json-Ukratko($o) { ($o | ConvertTo-Json -Compress) }
 function Utf8([string]$s) { [Text.Encoding]::UTF8.GetBytes($s) }
 
@@ -1277,6 +1299,10 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
   Log 'veza uspostavljena - sinkroniziram'
 
   while ($klijent.Connected) {
+    # Mrtva veza se mora primijetiti i kad se nista ne salje. Bez ovoga bi
+    # klijent ostao u petlji nad zatvorenom uticnicom - vidi Test-Veza.
+    if (-not (Test-Veza $klijent $stream)) { throw 'veza zatvorena' }
+
     # ---- 1. dolazno
     try {
       $iter = 0
