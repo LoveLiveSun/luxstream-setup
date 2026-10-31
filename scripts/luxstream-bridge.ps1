@@ -26,7 +26,9 @@
         .\luxstream-bridge.ps1 -Mode Server
 
     U VM-u (klijent). Ako se -Peer ne zada, uzima se zadani gateway - a to je
-    na Default Switchu upravo host:
+    na Default Switchu upravo host. Ako ni jedan gateway ne odgovori, klijent
+    sam potrazi posluzitelj na lokalnoj mrezi i zapamti ga, pa radi i kad je VM
+    prebacen na vanjski preklopnik (vidi Nadji-Hosta):
 
         .\luxstream-bridge.ps1 -Mode Client
 
@@ -52,8 +54,9 @@
         .\luxstream-bridge.ps1 -Status
         .\luxstream-bridge.ps1 -Uninstall      (zadatak; konfiguracija ostaje)
 
-    Ostalo (-NoClipboard, -NoFiles, -PollMs, -ChunkKB, -AllowedClients, granice
-    velicina) ima razumne zadane vrijednosti - vidi param blok.
+    Velicina datoteke nije ogranicena (granice su 0 = bez granice). Ostalo
+    (-NoClipboard, -NoFiles, -PollMs, -ChunkKB, -AllowedClients) ima razumne
+    zadane vrijednosti - vidi param blok.
 
     ==========================================================================
     ZASTO HOST SLUSA, A VM SE SPAJA
@@ -78,7 +81,11 @@
         0x10  TEKST      UTF-8 tekst (najvise MaxTextBytes)
         0x11  SLIKA      PNG bajtovi (najvise MaxImageBytes)
         0x12  POPIS      UTF-8 JSON  { count, ukupno }  - najava grupe datoteka
-        0x20  F_POCETAK  UTF-8 JSON  { name, size }
+        0x20  F_POCETAK  UTF-8 JSON  { name, size, rel? }
+                         "rel" ide SAMO za datoteku koja je izasla iz mape -
+                         relativna putanja s imenom mape na celu, da se na
+                         drugoj strani vrati ista struktura. Bez "rel" datoteka
+                         ide ravno u Primljeno\. Stariji sugovornik ga ignorira.
         0x21  F_KOMAD    sirovi bajtovi (komad od ChunkBytes)
         0x22  F_KRAJ     prazno
 
@@ -91,8 +98,15 @@
     ==========================================================================
       * Promet NIJE kriptiran. Zajednicka tajna u HELLO samo sprecava slucajan
         spoj, ne prisluskivanje. Namijenjeno povjerljivom LAN-u.
-      * Mape se ne prenose rekurzivno - samo datoteke. Za mapu je koristi
-        arhivu ili kopiraj u Drop/ u vise prolaza.
+      * Velicina datoteke NIJE ogranicena - prenosi se i najveca. Prijenos ide
+        u komadima i odmah na disk, pa velicina ne odreduje memoriju. Ako ipak
+        treba granica, postavi -ClipFileMaxMB / -DropFileMaxMB na >0.
+      * Mape SE prenose, rekurzivno. Kopirana mapa ide cijela, sa strukturom
+        podmapa. Junkcije (reparse points) se preskacu da se obilazak ne bi
+        vrtio u krug. Mapa iz Drop/ se ne razvija - Drop/ prima datoteke.
+      * Ponovno kopiranje ISTOG sadrzaja ne salje nista: prepoznaje se po
+        popisu putanja kao "nema promjene". Ako je datoteka u meduvremenu
+        promijenjena, kopiraj nesto drugo pa opet nju.
       * Most radi u INTERAKTIVNOJ sesiji. Windows servis u sesiji 0 ne vidi
         meduspremnik korisnika, pa kao servis NE RADI (tiho, bez greske).
 #>
@@ -112,8 +126,13 @@ param(
   [int]$MaxTextBytes  = 1048576,                  # 1 MB
   [int]$MaxImageBytes = 16777216,                 # 16 MB
   [int]$MaxFrameBytes = 67108864,                 # 64 MB - tvrdi zastit od ludog para
-  [int]$ClipFileMaxMB = 64,                       # najveci UKUPNI promet pri copy/paste datoteka
-  [int]$DropFileMaxMB = 4096,                     # najveca pojedinacna datoteka iz Drop/
+  # 0 = bez gornje granice (zadano). Datoteka ide u komadima od ChunkKB, a
+  # druga strana svaki komad odmah zapisuje na disk - velicina datoteke zato
+  # ne odreduje ni potrosnju memorije ni velicinu pojedinog okvira. Ogranicenje
+  # velicine je bilo samo politika, ne tehnicka nuznost, pa ga nema. Postavi
+  # na >0 (u MB) da ga vratis.
+  [int]$ClipFileMaxMB = 0,                        # najveci UKUPNI promet pri copy/paste datoteka
+  [int]$DropFileMaxMB = 0,                        # najveca pojedinacna datoteka iz Drop/
 
   [switch]$NoClipboard,
   [switch]$NoFiles,
@@ -303,7 +322,10 @@ function Dohvati-Meduspremnik {
       if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
         $popis = [System.Windows.Forms.Clipboard]::GetFileDropList()
         $dat = @()
-        foreach ($p in $popis) { if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { $dat += $p } }
+        # Prihvaca se I mapa, ne samo datoteka. Mapa se ne salje kao takva -
+        # razvija ju Prosiri-Putove - ali ovdje se odbacivala bez rijeci, pa je
+        # kopiranje mape izgledalo kao da se nista nije dogodilo.
+        foreach ($p in $popis) { if ($p -and (Test-Path -LiteralPath $p)) { $dat += $p } }
         if ($dat.Count -gt 0) { $r.Vrsta = 'files'; $r.Datoteke = $dat; return $r }
       }
       if ([System.Windows.Forms.Clipboard]::ContainsText()) {
@@ -397,10 +419,21 @@ function Send-Frame($stream, [byte]$tip, [byte[]]$payload) {
 function Read-Exact($stream, [int]$n) {
   $buf = New-Object byte[] $n
   $read = 0
+  $zadnji = Get-Date
   while ($read -lt $n) {
-    $k = $stream.Read($buf, $read, $n - $read)
+    try {
+      $k = $stream.Read($buf, $read, $n - $read)
+    } catch [System.IO.IOException] {
+      # Istek citanja je NORMALAN dok se ceka pocetak novog okvira, ali NIJE
+      # normalan na pola okvira: tip je vec procitan, pa bi se sljedeci bajt
+      # uzeo kao novi tip i cijeli bi se tok raslojio. Zato se ovdje ceka
+      # dalje - ali ne vjecno, jer bi mrtva veza inace visila zauvijek.
+      if (((Get-Date) - $zadnji).TotalSeconds -gt 60) { throw 'veza zastala na pola okvira' }
+      continue
+    }
     if ($k -le 0) { throw 'veza zatvorena' }
     $read += $k
+    $zadnji = Get-Date
   }
   , $buf
 }
@@ -444,13 +477,90 @@ function Slobodno-Ime($dir, [string]$ime) {
   Join-Path $dir ((Get-Date).ToString('HHmmss') + '-' + $ime)
 }
 
+# Razvija stavke iz meduspremnika (datoteke I MAPE) u parove
+# @{ Put = apsolutna putanja; Rel = relativna putanja }.
+#
+# Za golu datoteku relativna je samo njezino ime. Za mapu se rekurzivno prode
+# cijelo stablo, a relativna putanja nosi ime same mape na celu - tako druga
+# strana vrati "<mapa>\..." umjesto da se sadrzaj raspe razasut.
+#
+# Obilazak je rucni, s vlastitim stogom: Get-ChildItem -Recurse prati junkcije
+# (reparse points) i na mapi koja ih sadrzi vrti se u krug. Windows ih ima
+# posvuda - svaki "Application Data" je jedan.
+function Prosiri-Putove([string[]]$stavke) {
+  $parovi = New-Object System.Collections.ArrayList
+  $videno = New-Object 'System.Collections.Generic.HashSet[string]'
+  foreach ($p in $stavke) {
+    $fi = $null
+    try { $fi = Get-Item -LiteralPath $p -ErrorAction Stop } catch { continue }
+    if (-not $fi.PSIsContainer) {
+      if ($videno.Add($fi.Name)) { [void]$parovi.Add(@{ Put = $fi.FullName; Rel = $fi.Name }) }
+      continue
+    }
+    $baza = $fi.Name
+    $korijen = $fi.FullName.TrimEnd('\', '/')
+    $stog = New-Object System.Collections.Stack
+    $stog.Push($korijen)
+    while ($stog.Count -gt 0) {
+      $dir = [string]$stog.Pop()
+      $djeca = @()
+      try { $djeca = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop) } catch { continue }
+      foreach ($c in $djeca) {
+        if ((([int]$c.Attributes) -band ([int][System.IO.FileAttributes]::ReparsePoint)) -ne 0) { continue }
+        if ($c.PSIsContainer) { $stog.Push($c.FullName); continue }
+        $unutra = $c.FullName.Substring($korijen.Length).TrimStart('\', '/')
+        $rel = $baza + '/' + ($unutra -replace '\\', '/')
+        if ($videno.Add($rel)) { [void]$parovi.Add(@{ Put = $c.FullName; Rel = $rel }) }
+      }
+    }
+  }
+  # Bez trika sa zarezom: polje se pusta da se raspetlja normalno, a pozivatelj
+  # ga normalizira s @(...). Zarez bi ovdje polje umotao jos jednom, pa bi
+  # .Count bio 1 iako su unutra dva para.
+  $parovi.ToArray()
+}
+
+# Kamo primljena datoteka ide. Ako zaglavlje nosi "rel" (datoteka je dosla iz
+# mape), putanja se gradi ispod Primljeno\, segment po segment, i mape se
+# stvaraju usput - tako se vrati ista struktura kakva je poslana. Bez "rel"
+# ponasanje je kao prije: ravno u Primljeno\, uz sufiks kod kolizije.
+#
+# Svaki segment prolazi kroz Ocisti-Ime, pa se "..\..\Windows" ne moze popeti
+# izvan Primljeno\.
+function Odredi-Odrediste($zag) {
+  $rel = [string]$zag.rel
+  if ([string]::IsNullOrWhiteSpace($rel)) { return (Slobodno-Ime $prim (Ocisti-Ime $zag.name)) }
+  $seg = @()
+  foreach ($d in ($rel -replace '\\', '/').Split('/')) {
+    if ([string]::IsNullOrWhiteSpace($d)) { continue }
+    $seg += (Ocisti-Ime $d)
+  }
+  if ($seg.Count -eq 0) { return (Slobodno-Ime $prim (Ocisti-Ime $zag.name)) }
+  $dir = $prim
+  for ($i = 0; $i -lt ($seg.Count - 1); $i++) {
+    $dir = Join-Path $dir $seg[$i]
+    if (-not (Test-Path -LiteralPath $dir)) {
+      $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction SilentlyContinue
+    }
+  }
+  # Ako se mapa ne moze stvoriti (npr. prava pristupa), datoteka ide ravno u
+  # Primljeno\ - bolje izgubiti strukturu nego datoteku.
+  if (-not (Test-Path -LiteralPath $dir)) { return (Slobodno-Ime $prim (Ocisti-Ime $zag.name)) }
+  Slobodno-Ime $dir $seg[-1]
+}
+
 # ------------------------------------------------------------ slanje datoteke
-function Send-Datoteku($stream, [string]$putanja) {
+function Send-Datoteku($stream, [string]$putanja, [string]$rel = '') {
   $fi = Get-Item -LiteralPath $putanja -ErrorAction Stop
-  if ($fi.Length -gt ($DropFileMaxMB * 1MB)) {
+  if ($DropFileMaxMB -gt 0 -and $fi.Length -gt ($DropFileMaxMB * 1MB)) {
     throw ("prevelika ({0} MB > {1} MB)" -f [math]::Round($fi.Length/1MB,1), $DropFileMaxMB)
   }
-  Send-Frame $stream 0x20 (Utf8 (Json-Ukratko @{ name = $fi.Name; size = [int64]$fi.Length }))
+  # "rel" se salje samo za datoteku koja je izasla iz mape. Stariji sugovornik
+  # ga jednostavno ignorira i slozi datoteke ravno - to je staro ponasanje, a
+  # ne greska.
+  $zag = @{ name = $fi.Name; size = [int64]$fi.Length }
+  if ($rel) { $zag.rel = $rel }
+  Send-Frame $stream 0x20 (Utf8 (Json-Ukratko $zag))
 
   $fs = [System.IO.File]::Open($putanja, 'Open', 'Read', 'ReadWrite')
   try {
@@ -474,29 +584,32 @@ function Send-Datoteku($stream, [string]$putanja) {
   } finally { $fs.Dispose() }
 }
 
-# Izvor izlazne grupe: @{ Datoteke = @(putanje); Clip = $true/$false }
+# Izvor izlazne grupe: @{ Stavke = @(@{Put=...;Rel=...}); Clip = $true/$false }
+#
+# Stavke su VEC razvijene (vidi Prosiri-Putove) - tako se stablo mape obilazi
+# samo jednom, a ne i pri racunanju ukupne velicine i pri slanju.
 function Posalji-Grupu($stream, $grupa) {
-  $popis = @($grupa.Datoteke)
-  if ($popis.Count -eq 0) { return }
+  $stavke = @($grupa.Stavke)
+  if ($stavke.Count -eq 0) { return }
   $ukupno = 0
-  foreach ($p in $popis) { try { $ukupno += (Get-Item -LiteralPath $p -EA Stop).Length } catch { } }
+  foreach ($e in $stavke) { try { $ukupno += (Get-Item -LiteralPath $e.Put -EA Stop).Length } catch { } }
 
   if ($grupa.Clip) {
-    Send-Frame $stream 0x12 (Utf8 (Json-Ukratko @{ count = $popis.Count; ukupno = [int64]$ukupno }))
+    Send-Frame $stream 0x12 (Utf8 (Json-Ukratko @{ count = $stavke.Count; ukupno = [int64]$ukupno }))
   }
 
   $poslano = 0
-  foreach ($p in $popis) {
+  foreach ($e in $stavke) {
     try {
-      $n = Send-Datoteku $stream $p
+      $n = Send-Datoteku $stream $e.Put $e.Rel
       $poslano++
-      Log ("  -> datoteka {0}  ({1} B)" -f (Split-Path $p -Leaf), $n)
+      Log ("  -> datoteka {0}  ({1} B)" -f $e.Rel, $n)
       if ($grupa.Premjesti) {
-        $odred = Slobodno-Ime $posl $([System.IO.Path]::GetFileName($p))
-        try { Move-Item -LiteralPath $p -Destination $odred -Force -EA Stop } catch { }
+        $odred = Slobodno-Ime $posl $([System.IO.Path]::GetFileName($e.Put))
+        try { Move-Item -LiteralPath $e.Put -Destination $odred -Force -EA Stop } catch { }
       }
     } catch {
-      Log ("  [!] {0}: {1}" -f (Split-Path $p -Leaf), $_.Exception.Message)
+      Log ("  [!] {0}: {1}" -f $e.Rel, $_.Exception.Message)
     }
   }
   $grupa.Poslano = $poslano
@@ -572,7 +685,7 @@ if ($Install) {
     $stara = Ucitaj-Konf
     if ($stara) { $tajna = $stara.secret }
   }
-  if (-not $tajna) { $tajna = Nova-Tajna }
+  if (-not $tajna) { $tajna = '' }
 
   Spremi-Konf @{
     mode = $Mode; peer = $Peer; port = $Port; secret = $tajna
@@ -622,12 +735,17 @@ if ($Install) {
   }
   Say "Konfiguracija: $konf"
   Say ''
-  Say 'Zajednicka tajna - MORA BITI ista na obje strane:'
-  Say ('  ' + $tajna)
+  if ($tajna) {
+    Say 'Zajednicka tajna - MORA BITI ista na obje strane:'
+    Say ('  ' + $tajna)
+  } else {
+    Say 'Bez zajednicke tajne - provjerava se samo popis dopustenih adresa.'
+  }
   if ($Mode -eq 'Server') {
     $sw = Daj-Mrezu
     Say ''
-    Say "Na drugoj strani pokreni:  -Mode Client -Secret '$tajna'"
+    if ($tajna) { Say "Na drugoj strani pokreni:  -Mode Client -Secret '$tajna'" }
+    else        { Say 'Na drugoj strani pokreni:  -Mode Client' }
     if ($sw) {
       Say 'Klijent ne treba -Peer: sam uzme zadani gateway, a na Default Switchu'
       Say "je to upravo ova adresa ($($sw.Ip) na $($sw.Ali))."
@@ -664,7 +782,8 @@ if ($Install) {
   } else {
     Say ''
     Say 'Ne zaboravi na HOSTU pokrenuti drugu polovicu:'
-    Say "  .\luxstream-bridge.ps1 -Mode Server -Secret '$tajna' -Install"
+    if ($tajna) { Say "  .\luxstream-bridge.ps1 -Mode Server -Secret '$tajna' -Install" }
+    else        { Say '  .\luxstream-bridge.ps1 -Mode Server -Install' }
   }
   # Ako registracija nije prosla, pokretanje nema smisla - zadatka nema.
   if ($regOk) { Start-ScheduledTask -TaskName $zadatak -ErrorAction SilentlyContinue }
@@ -834,6 +953,28 @@ $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
   T 'prazno ime se sanira' ((Ocisti-Ime '   ') -eq 'datoteka')
   T 'kolizija dobiva sufiks' ((Split-Path (Slobodno-Ime $script:prim 'test.bin') -Leaf) -eq 'test-1.bin')
 
+  # 5. mape: rekurzivno razvijanje i vracanje strukture
+  $mapa = Join-Path $tmp 'Mapa'
+  New-Item -ItemType Directory -Path (Join-Path $mapa 'pod') -Force | Out-Null
+  Set-Content -Path (Join-Path $mapa 'a.txt') -Value 'a' -Encoding ASCII
+  Set-Content -Path (Join-Path $mapa 'pod\b.txt') -Value 'b' -Encoding ASCII
+
+  $par = @(Prosiri-Putove @($mapa))
+  $relovi = (@($par | ForEach-Object { $_.Rel }) | Sort-Object) -join ','
+  T 'mapa se razvija na sve svoje datoteke' ($par.Count -eq 2)
+  T 'relativna putanja nosi ime mape' ($relovi -eq 'Mapa/a.txt,Mapa/pod/b.txt')
+
+  $o1 = Odredi-Odrediste ([pscustomobject]@{ name = 'b.txt'; rel = 'Mapa/pod/b.txt' })
+  T 'rel vraca strukturu podmapa' ($o1 -eq (Join-Path $script:prim 'Mapa\pod\b.txt'))
+  T 'podmapa je stvorena' (Test-Path -LiteralPath (Join-Path $script:prim 'Mapa\pod'))
+
+  $o2 = Odredi-Odrediste ([pscustomobject]@{ name = 'x.txt' })
+  T 'bez rel ide ravno u Primljeno' ($o2 -eq (Join-Path $script:prim 'x.txt'))
+
+  # ".." mora zavrsiti kao obicno ime, a ne kao izlaz iz Primljeno\
+  $o3 = Odredi-Odrediste ([pscustomobject]@{ name = 'zlo.txt'; rel = '../../zlo.txt' })
+  T 'rel ne moze pobjeci iz Primljeno' ($o3.StartsWith($script:prim, [StringComparison]::OrdinalIgnoreCase))
+
   $cli.Close(); $srv.Close(); $lis.Stop()
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -847,7 +988,13 @@ $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
 $k = Ucitaj-Konf
 if (-not $Mode)     { $Mode = if ($k) { $k.mode } else { $null } }
 if (-not $Secret)   { $Secret = if ($k) { $k.secret } else { $null } }
-if (-not $Peer -and $k) { $Peer = $k.peer }
+# $PeerAuto znaci: adresa u bridge.json je NAJDENA skeniranjem, a ne upisana
+# rukom. Samo se takva smije kasnije zamijeniti - rukom zadanu adresu je netko
+# odlucio i ona ostaje, cak i kad trenutacno ne odgovara. Inace bi host koji je
+# promijenio adresu (DHCP) bio tiho izgubljen - isti kvar koji ovaj most upravo
+# prestaje praviti.
+$PeerAuto = $false
+if (-not $Peer -and $k) { $Peer = $k.peer; if ($k.peerAuto) { $PeerAuto = $true } }
 if ($k -and $k.port)    { if ($Port -eq 51888) { $Port = [int]$k.port } }
 
 # Mape se stvaraju PRIJE provjera, da bi se razlog zasto most nije krenuo
@@ -859,10 +1006,11 @@ if (-not $Mode) {
   Log 'most nije pokrenut: nema nacina rada (pokreni -Install)'
   throw 'Nema nacina rada. Zadaj -Mode Server ili -Mode Client (ili pokreni -Install).'
 }
-if (-not $Secret) {
-  Log 'most nije pokrenut: nema zajednicke tajne (pokreni -Install)'
-  throw 'Nema zajednicke tajne. Zadaj -Secret ili pokreni -Install.'
-}
+# Zajednicka tajna je NAMJERNO neobavezna. Njome se sprecava samo slucajno
+# spajanje; pravi filtar je popis dopustenih adresa. Kad tajne nema, posluzitelj
+# prihvaca svaki pozdrav - inace se klijent koji tajnu nikad nije dobio ne moze
+# spojiti, a kvar izgleda kao "nista se ne dogadja" na oba stroja.
+if ($null -eq $Secret) { $Secret = '' }
 
 # Klijent: koje adrese posluzitelja uopce pokusavati.
 #
@@ -873,6 +1021,11 @@ if (-not $Secret) {
 # rutu (vanjski LAN). Gateway s najboljom metrikom tada ne mora biti host, pa
 # bi se klijent zauvijek kucao na vrata koja nisu nigdje. Zato se pamte svi
 # kandidati i pokusavaju po redu - pogresan se preskoci u sljedecem krugu.
+#
+# Ako ni jedan ne prodje, klijent NE ostaje na tome: potrazi posluzitelj na
+# lokalnoj vezi i zapamti ga (vidi Nadji-Hosta). Time prestaje ovisiti o tome
+# je li zadani gateway ujedno i host - sto vrijedi na Default Switchu, ali ne i
+# kad je VM prebacen na vanjski preklopnik, gdje je gateway pravi router.
 $kandidati = @()
 if ($Mode -eq 'Client') {
   if ($Peer) {
@@ -908,6 +1061,114 @@ function Povezi-Se([string]$Adresa) {
   @{ Klijent = $klijent; Stream = $s }
 }
 
+# ------------------------------------------------------------------- trazenje
+# Kad posluzitelj nije ni na jednom zadanom gatewayu, preostaje ga potraziti na
+# lokalnoj vezi. To je slucaj koji se lako previdi: VM koji visi na VANJSKOM
+# preklopniku ima za zadani gateway pravi router, a ne host - pa klijent bez
+# -Peer kuca na vrata za kojima nema nista, i to zauvijek, bez ijedne vidljive
+# greske. Oba stroja su na istoj mrezi, samo se ne gadjaju.
+#
+# Skenira se lokalna /24 svakog IPv4 sucelja. Siri prefiks (/20 i slicno) znaci
+# tisuce adresa bez koristi, a posluzitelj ionako mora biti na istom linku.
+#
+# Uspjeh se NE cita iz toga sto je port otvoren - otvoren port dokazuje samo da
+# tamo nesto slusa, ne da je to NAS posluzitelj. Pravo dokazivanje je pozdrav sa
+# zajednickom tajnom: racuna se samo onaj koji odgovori 'OK'.
+function Nadji-Hosta {
+  param([int]$CekajMs = 3000, [int]$Najvise = 1024, [int]$PoSkupini = 128)
+
+  $moje = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+              Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+              ForEach-Object { $_.IPAddress })
+  if ($moje.Count -eq 0) { return $null }
+
+  $ciljevi = New-Object System.Collections.Generic.List[string]
+  foreach ($m in @($moje | ForEach-Object { ($_ -split '\.')[0..2] -join '.' } | Select-Object -Unique)) {
+    foreach ($h in 1..254) {
+      $a = "$m.$h"
+      if ($moje -contains $a) { continue }
+      $ciljevi.Add($a)
+      if ($ciljevi.Count -ge $Najvise) { break }
+    }
+    if ($ciljevi.Count -ge $Najvise) { break }
+  }
+  if ($ciljevi.Count -eq 0) { return $null }
+
+  # U dnevnik, a ne samo na konzolu: most se vrti iz zakazanog zadatka sa
+  # skrivenim prozorom, pa je konzola nigdje. Kad se ovo pisalo samo na
+  # konzolu, "klijent ne nalazi posluzitelj" nije ostavljalo ni jedan trag.
+  Log ("posluzitelj nije na gatewayu - skeniram " + $ciljevi.Count + " adresa na portu $Port")
+
+  for ($poc = 0; $poc -lt $ciljevi.Count; $poc += $PoSkupini) {
+    $skupina = @($ciljevi | Select-Object -Skip $poc -First $PoSkupini)
+
+    # Svi spojevi idu ODJEDNOM. Jedan po jedan bi trajao minutama i most bi se
+    # u meduvremenu ponasao kao da je mrtav.
+    $ceka = New-Object System.Collections.Generic.List[object]
+    foreach ($a in $skupina) {
+      try {
+        $c = [System.Net.Sockets.TcpClient]::new()
+        $ceka.Add(@{ A = $a; C = $c; T = $c.BeginConnect($a, $Port, $null, $null) })
+      } catch { }
+    }
+
+    # Rok je za cijelu skupinu, ali se cekanje vodi PO SPOJU. Prije je skupina
+    # dijelila jedan rok, pa je sve sto nije stiglo unutar njega proglaseno
+    # mrtvim - a 256 spojeva odjednom ne stigne ni zapoceti u roku. Ziv
+    # posluzitelj je tako zavrsio medju "mrtvima": na njemu se vidjela veza
+    # koja se odmah zatvori bez ijednog bajta, pa nije bilo ni "ODBIJEN" ni
+    # "spojen", a klijent je zakljucio da posluzitelja nema nigdje.
+    # Sada se svaki spoj ceka pojedinacno do isteka roka, a stanje se cita iz
+    # IsCompleted - pa se prepozna i onaj koji je zavrsio tek nakon isteka.
+    $pocetak = Get-Date
+    $zivi = New-Object System.Collections.Generic.List[string]
+    foreach ($e in $ceka) {
+      while (((Get-Date) - $pocetak).TotalMilliseconds -lt $CekajMs) {
+        try { if ($e.T.AsyncWaitHandle.WaitOne(40)) { break } } catch { break }
+      }
+      try { if ($e.T.IsCompleted -and $e.C.Connected) { $zivi.Add($e.A) } } catch { }
+    }
+    # Mrtve spojeve zatvaram odmah, da se ne skupljaju rukovatelji kroz krugove.
+    foreach ($e in $ceka) {
+      if ($zivi -notcontains $e.A) { try { $e.C.Close() } catch { } }
+    }
+
+    foreach ($a in $zivi) {
+      try {
+        $v = Povezi-Se $a            # salje pozdrav i trazi 'OK'
+        try { $v.Klijent.Close() } catch { }
+        Log "nadjen posluzitelj na ${a}:$Port"
+        return $a
+      } catch { }
+    }
+    # I probni spojevi zivih se zatvaraju. Bez toga ostane po jedan otvoren
+    # u svakom krugu, pa posluzitelj stalno biljezi parove "spojen pa odmah
+    # zatvoreno" - sto izgleda kao kvar, a kvar nije.
+    foreach ($e in $ceka) {
+      if ($zivi -contains $e.A) { try { $e.C.Close() } catch { } }
+    }
+  }
+  return $null
+}
+
+# Nadenu adresu treba i zapamtiti, inace bi se skeniranje ponavljalo pri svakom
+# pokretanju. Zapis ide u bridge.json: to je jedina konfiguracija koju most
+# ionako cita, pa nema drugoga mjesta koje bi trebalo drzati u sinkronizaciji.
+# Most se vrti iz zakazanog zadatka s -RunLevel Highest, pa ima pravo pisati
+# tamo gdje obican korisnik ne bi imao.
+function Zapisi-Peer([string]$adresa) {
+  try {
+    $staro = Ucitaj-Konf
+    if (-not $staro) { return $false }
+    $novo = @{}
+    foreach ($p in $staro.PSObject.Properties) { $novo[$p.Name] = $p.Value }
+    $novo['peer'] = $adresa
+    $novo['peerAuto'] = $true        # najdeno skeniranjem, nije upisano rukom
+    [IO.File]::WriteAllText($konf, ($novo | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+    return $true
+  } catch { return $false }
+}
+
 # ------------------------------------------------------------------ posluzitelj
 function Vrti-Posluzitelj {
   $lis = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $Port)
@@ -935,7 +1196,10 @@ function Vrti-Posluzitelj {
         $uvod = Receive-Frame $s
         $podaci = $null
         if ($uvod.Tip -eq 0x01) { $podaci = [Text.Encoding]::UTF8.GetString($uvod.Payload) | ConvertFrom-Json }
-        if (-not $podaci -or $podaci.secret -ne $Secret) {
+        # Prazna tajna na ovoj strani znaci "ne provjeravaj" - isto kao u
+        # LuxBridge::handleFrame na hostu. Popis dopustenih adresa se provjerio
+        # prije ovoga i on je pravi filtar.
+        if (-not $podaci -or ($Secret -and $podaci.secret -ne $Secret)) {
           Log "ODBIJEN $ip - pogresna tajna"
           Send-Frame $s 0x02 (Utf8 'NO')
           $klijent.Close(); continue
@@ -958,6 +1222,8 @@ function Vrti-Klijenta {
   Say ("Drop: $drop   ->   Primljeno: $prim")
   $cekaj = 2
   $i = 0
+  $promasaja = 0
+  $zadnjiSken = [datetime]::MinValue
   while ($true) {
     $adresa = $kandidati[$i % $kandidati.Count]
     $v = $null          # bez ovoga bi neuspjeh ostavio proslu, vec zatvorenu vezu
@@ -965,15 +1231,36 @@ function Vrti-Klijenta {
       $v = Povezi-Se $adresa
       Log "spojen na ${adresa}:$Port"
       $cekaj = 2
+      $promasaja = 0
       Sync-Loop $v.Klijent $v.Stream 'Client'
     } catch {
       Log "nema veze na ${adresa}:$Port ($($_.Exception.Message)); novi pokusaj za $cekaj s"
+      $promasaja++
     } finally {
       try { if ($v) { $v.Klijent.Close() } } catch { }
     }
     # Vise kandidata -> svaki krug ide na sljedecu adresu, pa se pogresan
     # gateway preskoci u jednom krugu umjesto zauvijek.
     if ($kandidati.Count -gt 1) { $i++ }
+
+    # Adresa nije zadana rukom (ili je zadana skeniranjem, pa smije biti
+    # zamijenjena), a veza ne radi -> posluzitelj je negdje na lokalnoj vezi.
+    # Skenira se najvise svakih 15 s, da se trajno lose stanje ne pretvori u
+    # trajno skeniranje mreze.
+    if ((-not $Peer -or $PeerAuto) -and $promasaja -ge 1 -and ((Get-Date) - $zadnjiSken).TotalSeconds -ge 15) {
+      $zadnjiSken = Get-Date
+      $nadjen = Nadji-Hosta
+      if ($nadjen) {
+        $script:Peer = $nadjen
+        $script:PeerAuto = $true
+        $kandidati = @($nadjen)
+        $i = 0
+        $cekaj = 2
+        if (Zapisi-Peer $nadjen) { Log "adresa posluzitelja zapamcena u $konf" }
+        else { Log 'adresu nisam mogao zapamtiti, ali je koristim u ovoj sesiji' }
+      }
+    }
+
     Start-Sleep -Seconds $cekaj
     if ($cekaj -lt 30) { $cekaj = [Math]::Min(30, $cekaj * 2) }
   }
@@ -1022,8 +1309,7 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           }
           0x20 {
             $h = [Text.Encoding]::UTF8.GetString($f.Payload) | ConvertFrom-Json
-            $ime = Ocisti-Ime $h.name
-            $odred = Slobodno-Ime $prim $ime
+            $odred = Odredi-Odrediste $h
             $fs = [System.IO.File]::Open($odred, 'Create', 'Write')
             $script:Rx = @{
               Fs = $fs; Putanja = $odred; Got = 0; Ocekivano = [int64]$h.size
@@ -1072,12 +1358,15 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
             }
           }
           'files' {
+            # Mape se razvijaju OVDJE, jednom - Posalji-Grupu dobiva gotove
+            # stavke, pa se stablo ne obilazi i pri racunanju velicine.
+            $stavke = @(Prosiri-Putove $s.Datoteke)
             $ukupno = 0
-            foreach ($p in $s.Datoteke) { try { $ukupno += (Get-Item -LiteralPath $p -EA Stop).Length } catch { } }
-            if ($ukupno -le ($ClipFileMaxMB * 1MB)) {
+            foreach ($e in $stavke) { try { $ukupno += (Get-Item -LiteralPath $e.Put -EA Stop).Length } catch { } }
+            if ($ClipFileMaxMB -le 0 -or $ukupno -le ($ClipFileMaxMB * 1MB)) {
               $script:ZadnjiHash = $h
-              Posalji-Grupu $stream @{ Datoteke = $s.Datoteke; Clip = $true; Premjesti = $false }
-              Log ("  -> u meduspremnik poslano {0} datoteka ({1} MB)" -f $s.Datoteke.Count, [math]::Round($ukupno/1MB,1))
+              Posalji-Grupu $stream @{ Stavke = $stavke; Clip = $true; Premjesti = $false }
+              Log ("  -> u meduspremnik poslano {0} datoteka ({1} MB)" -f $stavke.Count, [math]::Round($ukupno/1MB,1))
             } else {
               Log ("  [!] kopirano {0} MB > {1} MB - preskacem; koristi mapu Drop" -f [math]::Round($ukupno/1MB,1), $ClipFileMaxMB)
               $script:ZadnjiHash = $h
@@ -1098,7 +1387,7 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           if (-not $staro) { continue }     # datoteka se jos kopira
           $zadnjiDrop[$kljuc] = $true
           Log ("  -> Drop: {0} ({1} B)" -f $fi.Name, $fi.Length)
-          Posalji-Grupu $stream @{ Datoteke = @($fi.FullName); Clip = $false; Premjesti = $true }
+          Posalji-Grupu $stream @{ Stavke = @(@{ Put = $fi.FullName; Rel = $fi.Name }); Clip = $false; Premjesti = $true }
         }
       } catch { Log ("  [!] Drop: " + $_.Exception.Message) }
     }

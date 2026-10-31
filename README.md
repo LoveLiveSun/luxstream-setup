@@ -334,10 +334,18 @@ scheduled task would be completely silent.
 
 - Traffic is **not encrypted**. The shared secret only prevents accidental connections.
   Intended for a trusted LAN.
-- Folders are **not sent recursively** — files only. Archive a folder, or copy into
-  `Drop\` in several passes.
-- Caps: text 1 MB, image 16 MB, 64 MB total per clipboard file group, 4 GB per `Drop\`
-  file, 64 MB per frame.
+- **Folders are sent**, recursively. Copying a folder in Explorer recreates the same tree
+  on the other side, subfolders included. Junctions (reparse points) are skipped so the
+  walk cannot loop. A folder dropped into `Drop\` is not expanded — `Drop\` takes files.
+- Copying **the same content twice** sends nothing the second time: it is recognised as
+  "no change" from the path list. If a file changed in the meantime, copy something else
+  and then copy it again.
+- **File size is not capped** — any size transfers, from either the clipboard or `Drop\`.
+  Transfers are chunked (256 KB) and each chunk is written straight to disk on the far
+  side, so size does not drive memory use. Set `-ClipFileMaxMB` / `-DropFileMaxMB` above 0
+  to impose a limit again.
+- Caps that remain are per-message guards, not size limits: text 1 MB, image 16 MB, 64 MB
+  per frame.
 - Names are sanitised (any path stripped, `<>:"|?*` and control characters become `_`,
   truncated to 180 chars); collisions get a `-1`, `-2`… suffix.
 - It needs an **interactive session**. As a service it does nothing — silently.

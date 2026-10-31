@@ -460,10 +460,19 @@ lokalna anketa vidjela vlastiti zapis kao „novo" i poslala ga natrag u petlji.
 
 - Promet **nije kriptiran**. Zajednička tajna u `HELLO` samo sprječava slučajan spoj, ne
   prisluškivanje. Namijenjeno povjerljivom LAN-u.
-- Mape se **ne prenose rekurzivno** — samo datoteke. Za mapu koristi arhivu ili kopiraj u
-  `Drop\` u više prolaza.
-- Granice: tekst 1 MB, slika 16 MB, ukupno pri copy/paste datoteka 64 MB, pojedinačna
-  datoteka iz `Drop\` 4 GB, okvir 64 MB.
+- Mape se **prenose**, rekurzivno. Kopirana mapa u Exploreru vraća istu strukturu na
+  drugoj strani, zajedno s podmapama. Junkcije (reparse points) se preskaču da se
+  obilazak ne bi vrtio u krug. Mapa ubačena u `Drop\` se ne razvija — `Drop\` prima
+  datoteke.
+- Ponovno kopiranje **istog sadržaja** ne šalje ništa drugi put: prepoznaje se kao
+  "nema promjene" po popisu putanja. Ako je datoteka u međuvremenu promijenjena, kopiraj
+  nešto drugo pa opet nju.
+- **Veličina datoteke nije ograničena** — prenosi se svaka, i iz meduspremnika i iz
+  `Drop\`. Prijenos ide u komadima (256 KB) i svaki komad se na drugoj strani odmah
+  zapisuje na disk, pa veličina ne određuje potrošnju memorije. Postavi
+  `-ClipFileMaxMB` / `-DropFileMaxMB` na >0 da granicu vratiš.
+- Preostale granice su zaštita pojedine poruke, ne granica veličine: tekst 1 MB, slika
+  16 MB, okvir 64 MB.
 - Ime se sanira (odbacuje se svaka putanja, `<>:"|?*` i upravljački znakovi idu u `_`,
   skraćuje na 180 znakova), a kolizija dobiva sufiks `-1`, `-2`…
 - Radi **samo u interaktivnoj sesiji**. Kao servis ne radi — tiho, bez greške.

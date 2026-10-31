@@ -19,7 +19,7 @@
         -PreskociUiAccess   ne dira manifest ni potpis Sunshinea
         -PreskociAutoPrijavu ne postavlja automatsku prijavu
         -PreskociMost       ne registrira most za meduspremnik i datoteke
-        -TajnaMosta "..."   zajednicka tajna mosta; inace se izgenerira i ispise
+        -TajnaMosta "..."   zajednicka tajna mosta; neobavezna - bez nje se provjerava samo popis adresa
         -Gpu "ime"          ime GPU-a za VDD; inace se otkriva samo
 
     STO RADI, redom
@@ -208,7 +208,13 @@ function Vrati-Prozor {
     $h = [PROZOR]::GetConsoleWindow()
     if ($h -eq [IntPtr]::Zero) { return }
 
-    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    # WinForms se ucitava JEDNOM. Ranije se Add-Type zvao pri svakom pozivu, a
+    # poziva je desetak - ucitavanje assemblyja je najskuplji dio ovog poziva,
+    # pa se ponavljao bez potrebe.
+    if (-not $script:prozorWinForms) {
+      Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+      $script:prozorWinForms = $true
+    }
     # svjez podatak o zaslonima - AllScreens se kesira po procesu, pa se
     # osvjezava preko novog upita na tip
     $glavni = [System.Windows.Forms.Screen]::AllScreens | Where-Object { $_.Primary } | Select-Object -First 1
@@ -1014,35 +1020,87 @@ if ($biosUuid) { Set-Content $pecatDat $pecatSad -Encoding ASCII }
 
 # GUID VDD displaya je specifican za svaki VM. Sunshine ga zapise u log pri
 # nabrajanju, pa ga odatle procitamo.
+#
+# OPREZ - ovdje se 31.10.2026. instalater ZAGLAVIO na VM-u DESKTOP-QRT4CQP:
+# u luxstream-install.log zadnji redak je ostao "Looking up the VDD display
+# GUID", sunshine.conf je ostao 0 bajtova, a Sunshine nije bio ni ugasen.
+# Uzrok je bio cekanje, ne Sunshine: popis displaya Sunshine ispise odmah na
+# pocetku rada (izmjereno 0.1 s nakon pokretanja), a stari je kod cekao fiksno
+# 25 s po pokusaju i to TRI puta - oko 85 s potpune TISINE, bez ijednog retka
+# na konzoli. Uz to se dnevnik citao s Get-Content, koji na datoteci koju
+# Sunshine drzi otvorenom moze i puknuti i zaglaviti se.
+#
+# Sada: Sunshine se pokrene, dnevnik se procita svakih 500 ms dok se blok s
+# popisom ne pojavi (obicno u prvom ili drugom krugu), i to izravno preko
+# FileStreama s ReadWrite dijeljenjem. Cekanje je ograniceno na 20 s, a
+# svakih 5 s se ispise koliko se ceka - da tisina ne izgleda kao smrzavanje.
 if ($prekoRdp) {
   Warn 'Over RDP the display GUID is not looked up - Sunshine would enumerate the RDP screen'
   Inf  'sunshine.conf goes without output_name; Sunshine will capture the primary display.'
   $guid = $null
 } else {
   Inf 'Looking up the VDD display GUID'
-$guid = $null
-for ($pokusaj = 1; $pokusaj -le 3 -and -not $guid; $pokusaj++) {
-  Get-Process sunshine -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-  Start-Sleep -Seconds 3
-  Remove-Item $log -ErrorAction SilentlyContinue
-  # Skriveno - inace Sunshineov konzolni prozor dodje u prvi plan i prekrije nas,
-  # pa korisnik vidi da se Sunshine dize ali ne vidi instalaciju.
-  Start-Process $sxe -WorkingDirectory (Split-Path $sxe -Parent) -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
-  Start-Sleep -Milliseconds 500
-  Vrati-Prozor
-  Start-Sleep -Seconds 25
-  if (Test-Path $log) {
-    $tekst = Get-Content $log -Raw
-    # trazi blok s friendly_name 'VDD by MTT' i uzmi njegov device_id
-    # Izmedu "device_id" i "friendly_name" stoji ugnijezdeni "edid" blok, pa se ne
-    # smije koristiti [^}]*. Uvjet (?!"device_id") osigurava da se ne preskoci u
-    # sljedeci uredaj i uhvati krivi GUID.
-    $uzorak = '"device_id"\s*:\s*"(\{[0-9a-fA-F-]+\})"(?:(?!"device_id")[\s\S])*?"friendly_name"\s*:\s*"VDD by MTT"'
-    $m = [regex]::Match($tekst, $uzorak)
-    if ($m.Success) { $guid = $m.Groups[1].Value }
+
+  $guid = $null
+  # trazi blok s friendly_name 'VDD by MTT' i uzmi njegov device_id
+  # Izmedu "device_id" i "friendly_name" stoji ugnijezdeni "edid" blok, pa se ne
+  # smije koristiti [^}]*. Uvjet (?!"device_id") osigurava da se ne preskoci u
+  # sljedeci uredaj i uhvati krivi GUID.
+  $uzorak = '"device_id"\s*:\s*"(\{[0-9a-fA-F-]+\})"(?:(?!"device_id")[\s\S])*?"friendly_name"\s*:\s*"VDD by MTT"'
+
+  for ($pokusaj = 1; $pokusaj -le 2 -and -not $guid; $pokusaj++) {
+    Get-Process sunshine -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Remove-Item $log -Force -ErrorAction SilentlyContinue
+    # Skriveno - inace Sunshineov konzolni prozor dodje u prvi plan i prekrije nas,
+    # pa korisnik vidi da se Sunshine dize ali ne vidi instalaciju.
+    # Vrati-Prozor se ovdje NE zove: konzolu dizemo poslije, u fazi 5, a poziv
+    # usred pokretanja Sunshinea je bio drugi kandidat za zaglavljivanje.
+    Start-Process $sxe -WorkingDirectory (Split-Path $sxe -Parent) -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+
+    $stao = [Diagnostics.Stopwatch]::StartNew()
+    $sljedeci = 5
+    while ($stao.Elapsed.TotalSeconds -lt 20 -and -not $guid) {
+      $tekst = ''
+      try {
+        # ReadWrite dijeljenje je ovdje bitno - Sunshine drzi ovu datoteku
+        # otvorenu dok radi, a Get-Content je na takvoj datoteci nepouzdan.
+        $fs = [System.IO.File]::Open($log, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+          $sr = New-Object System.IO.StreamReader($fs)
+          $tekst = $sr.ReadToEnd()
+          $sr.Dispose()
+        } finally { $fs.Dispose() }
+      } catch { }
+      if ($tekst) {
+        $m = [regex]::Match($tekst, $uzorak)
+        if ($m.Success) { $guid = $m.Groups[1].Value; break }
+        # Popis JE ispisan, ali VDD-a u njemu nema (npr. driver se nije digao).
+        # Cekati dalje nema smisla - Sunshine ga nece dodati sam.
+        # Uvjet za "ispisan" trazi i barem jedno "friendly_name": ako bi
+        # Sunshine dnevnik pisao u dva koraka, sam naslov ne smije prekinuti
+        # cekanje prije nego sto popis stigne do kraja.
+        if ($tekst -match 'Currently available display devices' -and $tekst -match '"friendly_name"') { break }
+      }
+      if ($stao.Elapsed.TotalSeconds -ge $sljedeci) {
+        Inf ("  cekam popis displaya ... {0:N0} s" -f $stao.Elapsed.TotalSeconds)
+        $sljedeci += 5
+      }
+      Start-Sleep -Milliseconds 500
+    }
+    $stao.Stop()
+
+    # Sunshine se gasi UVIJEK, i kad je GUID naden i kad nije. Ako ovo
+    # preskocimo, u fazi 5 bi zadatak pokrenuo DRUGI Sunshine i dva bi se
+    # procesa tukla oko portova ("Sunshine radi (PID 12040 27772)" na G10).
+    Get-Process sunshine -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Ovaj je dnevnik pisan DOK je VDD bio sekundarni display, pa u njemu
+    # stoje DuplicateOutput i Fatal greske koje u fazi 7 ne smiju izgledati
+    # kao stvarni kvar. Brisemo ga - Sunshine ce ga sam stvoriti iznova.
+    Remove-Item $log -Force -ErrorAction SilentlyContinue
+    if (-not $guid -and $pokusaj -lt 2) { Inf '  Sunshine did not list the VDD display - trying once more' }
   }
-  if (-not $guid) { Inf "  attempt $pokusaj did not find the GUID" }
-}
 }
 
 # max_bitrate je GORNJA GRANICA u kbps, ne ciljna vrijednost. Sunshine uvijek
@@ -1154,6 +1212,13 @@ Ok 'Task VerifyAfterBoot registered'
 # klonovi), pa bi se na hostu stalno morala prepisivati. Klijent bez -Peer
 # sam uzme zadani gateway, a to je na Default Switchu upravo host.
 #
+# Zadani gateway NIJE dovoljan kad je VM prebacen na vanjski preklopnik: tada
+# je gateway pravi router, a host je negdje drugdje na istoj mrezi. Klijent se
+# zato ne zaustavlja na gatewayu - ako ni jedan ne odgovori, sam potrazi
+# posluzitelj na lokalnoj vezi, provjeri ga zajednickom tajnom i zapamti
+# adresu u bridge.json. Vidi Nadji-Hosta u luxstream-bridge.ps1. Zato ovdje
+# -Peer ostaje nepostavljen: to je zadani, samostalni put.
+#
 # Adresa samog Default Switcha se NE zna ovdje: nije ista na svakom stroju
 # (172.29.32.1 je cest, 172.21.80.1 jednako tako). Zato se u zavrsnom ispisu ne
 # navodi tvrda mreza za vatrozid - pravu ispise most na hostu, koji ju procita
@@ -1169,9 +1234,12 @@ if ($PreskociMost) {
   if ($TajnaMosta) { $mostParams.Secret = $TajnaMosta }
   & $skriptaMost -Install @mostParams
   Ok 'Task LuxstreamBridge registered (clipboard + files)'
-  # Zapisana tajna je izvor istine: i kad -TajnaMosta nije zadana, skripta ju
-  # je izgenerirala i zapisala. Cita se natrag da zavrsni ispis moze dati
-  # gotovu naredbu za host, bez prepisivanja.
+  # Zajednicka tajna je neobavezna. Ako je ima (zadana ili naslijedena iz
+  # postojece konfiguracije), cita se natrag da zavrsni ispis da gotovu naredbu
+  # za host. Ako je nema, NE izmislja se: prazna tajna znaci "ne provjeravaj", a
+  # izmisljena bi klijenta ostavila nepovezanog bez ijednog vidljivog znaka
+  # greske - posluzitelj odbije pozdrav, klijent suti, oba stroja izgledaju
+  # ispravno. Vidi i LuxBridge::handleFrame na hostu.
   if (Test-Path $konfMost) {
     try { $script:mostTajna = (Get-Content $konfMost -Raw -Encoding UTF8 | ConvertFrom-Json).secret } catch { }
   }
