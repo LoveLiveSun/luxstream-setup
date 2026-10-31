@@ -380,7 +380,13 @@ function Postavi-Datoteke([string[]]$putanje) {
     $null = Invoke-Sta @'
 $k = New-Object System.Collections.Specialized.StringCollection
 foreach ($p in $P) { [void]$k.Add($p) }
-[System.Windows.Forms.Clipboard]::SetFileDropList($k)
+$do = New-Object System.Windows.Forms.DataObject
+$do.SetData('FileDrop', $k)
+# Explorer uz popis datoteka uvijek salje i "Preferred DropEffect". Bez njega
+# ostaje samo jednostruki CF_HDROP, pa se Ctrl+V u Exploreru zna odbiti ili
+# zalijepiti kao tekst putanje umjesto kao datoteke. 1 = DROPEFFECT_COPY.
+$do.SetData('Preferred DropEffect', [byte[]](1,0,0,0))
+[System.Windows.Forms.Clipboard]::SetDataObject($do, $true)
 ""
 '@ @{ P = $putanje }
     return $true
