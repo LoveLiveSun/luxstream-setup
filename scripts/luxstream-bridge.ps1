@@ -381,10 +381,29 @@ function Postavi-Datoteke([string[]]$putanje) {
 $k = New-Object System.Collections.Specialized.StringCollection
 foreach ($p in $P) { [void]$k.Add($p) }
 $do = New-Object System.Windows.Forms.DataObject
-$do.SetData('FileDrop', $k)
+$do.SetFileDropList($k)
 # Explorer uz popis datoteka uvijek salje i "Preferred DropEffect". Bez njega
 # ostaje samo jednostruki CF_HDROP, pa se Ctrl+V u Exploreru zna odbiti ili
 # zalijepiti kao tekst putanje umjesto kao datoteke.
+#
+# NAJVAZNIJE: efekt se MORA predati kao MemoryStream, a NE kao goli byte[].
+# Kad se SetData preda byte[], .NET ga SERIALIZIRA i u meduspremnik odlozi
+# serializacijsko zaglavlje ISPRED podataka. Microsoft to izricito napominje u
+# dokumentaciji klase Clipboard: "If your target application requires a very
+# specific data format, the headers added to the data in the serialization
+# process may prevent the application from recognizing your data. To preserve
+# your data format, add your data as a Byte array to a MemoryStream and pass the
+# MemoryStream to the SetData method."
+#
+# Posljedica golog byte[] je podmukla: Explorer na odredistu procita prvih 4
+# bajta zaglavlja (0x00 0x00 0x00 0x00) kao DWORD, dobije DROPEFFECT_NONE = 0 i
+# NE URADI NISTO - bez greske i bez poruke. Ctrl+V na radnoj povrsini samo ne
+# napravi nista, a datoteka ostane u Primljenom. Vidjeno 31.10.2026. na VM-u:
+# prijenos je prosao, "u meduspremnik stavljeno 1 datoteka" je zapisano, a na
+# radnoj povrsini nije bilo nicega.
+#
+# Position se vraca na 0 jer citac moze citati od trenutne pozicije, a ne od
+# pocetka - nakon Write je pozicija na kraju streama.
 #
 # 2 = DROPEFFECT_MOVE, a NE 1 = DROPEFFECT_COPY. Primljeno je samo PRIVREMENO
 # odlagaliste: kad korisnik zalijepi datoteku na pravo mjesto (npr. na radnu
@@ -396,7 +415,10 @@ $do.SetData('FileDrop', $k)
 # meduspremniku, pa se isti meduspremnik NE moze zalijepiti dvaput. Zato se
 # Primljeno i ne prazni samo od sebe - datoteka ostaje tamo dok je korisnik ne
 # zalijepi (ili dok je rucno ne obrise).
-$do.SetData('Preferred DropEffect', [byte[]](2,0,0,0))
+$ms = New-Object System.IO.MemoryStream
+$ms.Write([byte[]](2,0,0,0), 0, 4)
+$ms.Position = 0
+$do.SetData('Preferred DropEffect', $true, $ms)
 [System.Windows.Forms.Clipboard]::SetDataObject($do, $true)
 ""
 '@ @{ P = $putanje }
