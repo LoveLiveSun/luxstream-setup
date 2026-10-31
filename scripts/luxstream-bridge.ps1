@@ -88,10 +88,64 @@
                          ide ravno u Primljeno\. Stariji sugovornik ga ignorira.
         0x21  F_KOMAD    sirovi bajtovi (komad od ChunkBytes)
         0x22  F_KRAJ     prazno
+        0x30  PAUZA      UTF-8 JSON  { name, size }   primaoc -> posiljatelj
+        0x31  NASTAVI    prazno                       primaoc -> posiljatelj
 
     POPIS sluzi da se nakon cijele grupe primljene datoteke mogu staviti u
     meduspremnik - tako "copy file" u Exploreru na jednoj strani zavrsi kao
     paste datoteke na drugoj, bez ikakvog rucnog koraka.
+
+    ==========================================================================
+    PAUZA / NASTAVI - zasto postoje (dodano 01.11.2026.)
+    ==========================================================================
+    Prije se prijenos pokretao Ctrl+C-om: cim se kopiranje primijeti, ovaj most
+    posalje najavu grupe i odmah pocne prenositi bajtove, a meduspremnik na
+    drugoj strani postavi TEK kad zadnji bajt sleti. Posljedica se mjerila u
+    stvarnim dnevnicima: kod ISO datoteke od 6,5 GB meduspremnik je bio gotov
+    3 min 19 s nakon Ctrl+C-a, kod one od 3,3 GB 1 min 33 s, a kod dokumenta od
+    0,4 MB u istoj sekundi. Ako korisnik zalijepi PRIJE toga, Explorer zalijepi
+    ono sto je u tom trenutku u meduspremniku (stari sadrzaj), a datoteka nikad
+    ne zavrsi tamo gdje je htjela. Upravo je to bio "prvi Ctrl+V ne radi".
+
+    Sada radi obrnuto - Ctrl+V pokrece prijenos:
+
+      1. Na F_POCETAK se na odredistu stvori datoteka VELICINE IZ NAJAVE
+         (SetLength, bez podataka) i meduspremnik se postavi ODMAH, s efektom
+         premjestanja. Od tog trenutka Ctrl+V radi - doslovno milisekunde
+         nakon Ctrl+C-a, bez obzira na velicinu.
+      2. Odmah se posalje PAUZA. Posiljatelj tada ZAUSTAVI slanje te datoteke.
+         Bez toga bi se datoteka na odredistu punila prije nego je korisnik
+         uopce odlucio kamo ide, a upravo je poanta da se bajtovi prenose tek
+         kad je odrediste poznato.
+      3. Drzac datoteke se otvara s dozvolom brisanja (FileShare.Delete), pa
+         Explorer zalijepljenu datoteku PREMJESTI (rename) na odrediste - a
+         nas otvoreni drzac je prati i dalje pise u istu datoteku, sad na
+         novom mjestu. Zato je nestanak putanje u Primljenom TOCAN signal
+         da je korisnik zalijepio.
+      4. Kad putanja nestane, posalje se NASTAVI i prijenos ide punom brzinom
+         u datoteku koja je vec tamo gdje ju je korisnik htio.
+      5. Ako nitko ne zalijepi unutar LazyCekajSec (zadano 10 min), salje se
+         NASTAVI i prijenos se dovrsava u Primljeno\ - tocno staro ponasanje,
+         nista se ne gubi.
+
+    Cijena, svjesno prihvacena: dok se ceka, datoteka na odredistu stoji
+    pune velicine ali bez sadrzaja (sparse; cita se kao nule dok ne pocne
+    pisanje).
+
+    VAZNO - lijepi unutar ISTOG diska. Kad se lijepi na drugi disk ili na
+    mrezu, Explorer premjestanje (MOVE) izvodi kao kopiranje + brisanje izvora.
+    Kopija tada nastane u trenutku lijepljenja, dakle dok je nasa datoteka jos
+    puna nula, a izvor se obrise - pa prijenos dalje ide u drzac koji pokazuje
+    na obrisanu datoteku i kopija na odredistu ostaje prazna. To se prepoznaje
+    po tome sto se putanja iz drzaca (GetFinalPathNameByHandleW) ne moze
+    procitati, i u dnevnik se zapise:
+      [!] zalijepljeno nakon N s, ali putanja iz drzaca nije citljiva ...
+    Primljeno\ i radna povrsina su po defaultu na C:, pa je ovo uobicajeni
+    slucaj i ne treba nista postavljati.
+
+    Stariji sugovornik (host bez 0x30/0x31) ove okvire odbaci kao nepoznate i
+    nastavi slati - ponasanje se svodi na staro, bez greske. Isto tako ovaj
+    most 0x30/0x31 u smjeru slanja samo zapise u dnevnik.
 
     ==========================================================================
     OGRANICENJA (namjerna)
@@ -136,6 +190,17 @@ param(
 
   [switch]$NoClipboard,
   [switch]$NoFiles,
+
+  # --- cekanje na lijepljenje (vidi PAUZA / NASTAVI u zaglavlju) -------------
+  # Datoteka manja od ove se ne ceka: prijenos je gotov prije nego oko stigne
+  # do Ctrl+V-a, pa bi pauza samo odgodila nesto sto ionako ne stigne procitati.
+  # 0 znaci "cekaj svaku datoteku iz meduspremnika".
+  [int]$LazyMinMB = 8,
+  # Najdulje cekanje na lijepljenje prije nego se odustane i prijenos dovrsi
+  # u Primljeno\ na stari nacin. Host ima svoj, dulji rok (15 min) kao zastita
+  # od sugovornika koji umre usred pauze, pa ovaj mora biti kraci.
+  [int]$LazyCekajSec = 600,
+  [switch]$NoLazy,                                # iskljuci cijeli mehanizam
 
   [switch]$DopustiVatru,                          # uz -Install -Mode Server: otvori port sada
 
@@ -260,6 +325,10 @@ function Daj-Mrezu {
 # jedan trajni STA runspace i sav pristup ide kroz njega.
 $script:StaRs = $null
 $script:PreskociDo = [datetime]::MinValue
+
+# Postavi na $true ako se Citac tipova za Putanja-Rukovanja nije mogao
+# sastaviti - tada se taj ukras u dnevniku preskace zauvijek (vidi tu funkciju).
+$script:LuxRukNema = $false
 
 function Init-Sta {
   if ($script:StaRs) { return }
@@ -635,6 +704,193 @@ function Odredi-Odrediste($zag) {
   Slobodno-Ime $dir $seg[-1]
 }
 
+# ------------------------------------------------- cekanje na lijepljenje ----
+# Tri stvari koje ovaj odjeljak radi, i sve tri su posljedica jednog zahtjeva:
+# prijenos mora krenuti Ctrl+V-om, a ne Ctrl+C-om. Potpuno objasnjenje je u
+# zaglavlju skripte pod "PAUZA / NASTAVI".
+
+# Kamo je datoteka otisla, procitano iz DRZACA a ne iz putanje.
+#
+# Kljucno: kad Explorer zalijepi datoteku s efektom premjestanja, on ju na
+# istom disku samo PREIMENUJE. Nas otvoreni drzac pokazuje na istu datoteku i
+# nakon preimenovanja, a ova funkcija iz njega procita TRENUTNU putanju - pa se
+# u dnevnik moze zapisati tocno mjesto gdje je korisnik zalijepio. To je i
+# dokaz da je mehanizam proradio, a ne samo da je putanja iz Primljenog
+# nestala.
+#
+# GetFinalPathNameByHandle vraca putanju s prefiksom \\?\ koji se ovdje skida.
+# Sve je u try/catch i NIJE obavezno: ako Citac tipova ne uspije (npr. nema
+# csc.exe), funkcija vrati prazno i provjera se i dalje radi preko Test-Path.
+function Putanja-Rukovanja($fs) {
+  if (-not $fs -or $script:LuxRukNema) { return '' }
+  try {
+    if (-not ('LuxRuk' -as [type])) {
+      Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class LuxRuk {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder p, uint c, uint f);
+    public static uint Putanja(SafeFileHandle h, StringBuilder p, int c) {
+        return GetFinalPathNameByHandleW(h, p, (uint)c, 0);
+    }
+}
+'@
+    }
+    $sb = New-Object System.Text.StringBuilder 1024
+    $n = [LuxRuk]::Putanja($fs.SafeFileHandle, $sb, $sb.Capacity)
+    if ($n -le 0 -or $n -gt $sb.Capacity) { return '' }
+    $p = $sb.ToString()
+    if ($p.StartsWith('\\?\UNC\')) { return ('\\' + $p.Substring(8)) }
+    if ($p.StartsWith('\\?\')) { $p = $p.Substring(4) }
+    return $p
+  } catch {
+    # Neuspjeh se pamti: bez toga bi se Citac tipova pokusavao sastaviti pri
+    # svakom lijepljenju, a to je sekunda ili dvije svaki put. Putanja je samo
+    # ukras u dnevniku - provjera lijepljenja radi i bez nje.
+    $script:LuxRukNema = $true
+    return ''
+  }
+}
+
+# Otvara odrediste i - ako se na ovu datoteku ceka - odmah stavlja meduspremnik
+# i salje PAUZU.
+#
+# Zasto se drzac otvara drugacije kad se ceka: obicno otvaranje (FileShare.None)
+# ZAKLJUCALO bi datoteku, pa ju Explorer ne bi mogao ni preimenovati ni
+# zalijepiti. Uz ReadWrite+Delete Explorer ju premjesti, a pisanje kroz nas
+# drzac ide dalje u istu datoteku.
+function Novi-Prijem([string]$odred, $zag, $stream) {
+  $velicina = [int64]$zag.size
+  $cekaj = $false
+
+  # Grupa s vise datoteka se NE ceka: meduspremnik se za grupu postavlja tek
+  # kad su sve stigle (sve putanje odjednom), pa se prije toga nema sto
+  # zalijepiti - a meduspremnik se ne smije mijenjati u pola grupe, jer bi
+  # korisnik zalijepio samo jednu od njih. Kod grupe s JEDNOM datotekom je
+  # najava vec rekla sve sto treba.
+  if (-not $NoLazy -and $velicina -ge ($LazyMinMB * 1MB)) {
+    if ($script:Grupa -and $script:Grupa.Preostalo -eq 1) { $cekaj = $true }
+  }
+
+  if ($cekaj) {
+    $fs = New-Object System.IO.FileStream -ArgumentList @(
+      $odred,
+      [System.IO.FileMode]::Create,
+      [System.IO.FileAccess]::Write,
+      ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+    # Datoteka odmah dobiva punu velicinu iz najave. Bez toga Explorer ne bi
+    # imao sto zalijepiti - a s njom je na odredistu odmah datoteka tocne
+    # velicine, koju nas drzac zatim puni.
+    try { $fs.SetLength($velicina) } catch { Log ("  [!] ne mogu postaviti velicinu: " + $_.Exception.Message) }
+  } else {
+    $fs = [System.IO.File]::Open($odred, 'Create', 'Write')
+  }
+
+  $rx = @{
+    Fs = $fs; Putanja = $odred; Got = 0; Ocekivano = $velicina
+    Grupa = $script:Grupa
+    ClipGrupa = ($null -ne $script:Grupa)
+    Lijepi = $cekaj
+    Ceka = $false
+    CekanjeOd = [datetime]::MinValue
+  }
+
+  if ($cekaj) {
+    if (Postavi-Datoteke @($odred)) {
+      # Hash se racuna iz onoga sto je poslano, pa lokalna anketa ovo ne vidi
+      # kao nov sadrzaj i ne posalje natrag - vidi Zapamti-Poznati.
+      Zapamti-Poznati @{ Vrsta = 'files'; Datoteke = @($odred) }
+      $rx.Ceka = $true
+      $rx.CekanjeOd = Get-Date
+      Send-Frame $stream 0x30 (Utf8 (Json-Ukratko @{ name = (Split-Path $odred -Leaf); size = $velicina }))
+      Log ("  <- meduspremnik spreman PRIJE prijenosa: {0} ({1} MB) - Ctrl+V sad radi, cekam" -f `
+             (Split-Path $odred -Leaf), [math]::Round($velicina / 1MB, 1))
+    } else {
+      # Meduspremnik nije postavljen - nema smisla ni cekati ni zaustavljati
+      # posiljatelja. Prijenos ide dalje, starim nacinom.
+      $rx.Lijepi = $false
+      Log ("  [!] meduspremnik nije postavljen - primam {0} bez cekanja" -f (Split-Path $odred -Leaf))
+    }
+  }
+
+  $rx
+}
+
+# Je li korisnik zalijepio? Provjera ide po okretaju petlje (PollMs).
+#
+# Signal je nestanak same putanje: Explorer je s efektom premjestanja datoteku
+# PREMJESTIO iz Primljenog, pa je tamo vise nema. Nas drzac je prati (zato
+# FileShare.Delete u Novi-Prijem), a pisanje kroz njega ide u premjestenu
+# datoteku.
+#
+# Ako nitko ne zalijepi u roku, salje se NASTAVI i prijenos se dovrsi u
+# Primljeno\ - tocno staro ponasanje. Nista se ne gubi ni u jednom slucaju.
+function Provjeri-Lijepljenje($rx, $stream) {
+  if (-not $rx -or -not $rx.Ceka) { return }
+
+  $sada = Get-Date
+  $cekalo = [int]($sada - $rx.CekanjeOd).TotalSeconds
+
+  if (Test-Path -LiteralPath $rx.Putanja) {
+    if ($cekalo -le $LazyCekajSec) { return }
+    $rx.Ceka = $false
+    Send-Frame $stream 0x31 @()
+    Log ("  [!] nitko nije zalijepio {0} s - nastavljam i pisem dalje u Primljeno\" -f $cekalo)
+    return
+  }
+  $rx.Ceka = $false
+  Send-Frame $stream 0x31 @()
+  $kamo = Putanja-Rukovanja $rx.Fs
+  if ($kamo) {
+    Log ("  <- zalijepljeno nakon {0} s - nastavljam punom brzinom  ->  {1}" -f $cekalo, $kamo)
+  } else {
+    # Putanja se iz drzaca ne moze procitati. Najcesce to znaci da je datoteka
+    # OBRISANA, a ne preimenovana - a to se dogodi kod lijepljenja na DRUGI
+    # disk: Explorer s efektom premjestanja tada kopira datoteku i izbrise
+    # izvor. Kopija nastaje u trenutku lijepljenja, dakle dok je nasa datoteka
+    # jos puna nula, a prijenos dalje ide u drzac koji pokazuje na obrisanu
+    # datoteku. Kopija na odredistu ostaje neispravna i to se ovime ne moze
+    # popraviti - moze se samo zapisati da se uzrok vidi u dnevniku.
+    $poruka = "  [!] zalijepljeno nakon {0} s, ali putanja iz drzaca nije citljiva - " +
+              "datoteka je vjerojatno OBRISANA (lijepljenje na DRUGI disk). " +
+              "Kopija na odredistu moze ostati prazna - lijepi unutar ISTOG diska."
+    Log ($poruka -f $cekalo)
+  }
+}
+
+# Tekst i slika koji stignu DOK se ceka na lijepljenje.
+#
+# Meduspremnik u tom trenutku drzi putanju datoteke koju korisnik upravo
+# lijepi. Postaviti tekst preko toga znaci pojesti upravo ono sto korisnik
+# lijepi. Zato se takav sadrzaj ne odbacuje nego ODGADA - primijeni se odmah
+# nakon sto prijenos krene. U praksi se ovo ne bi trebalo ni dogoditi: host
+# ne salje meduspremnik dok drzi pauzu (vidi pollClipboard u luxbridge.cpp).
+# Ovo je druga linija obrane, za stariji host koji PAUZU ignorira.
+function Odgodi-Meduspremnik([string]$vrsta, $sadrzaj) {
+  $script:Odgoda = @{ Vrsta = $vrsta; Sadrzaj = $sadrzaj }
+  Log ("  [.] {0} iz mreze odgodjen dok traje cekanje na lijepljenje" -f $vrsta)
+}
+
+function Primijeni-Odgodu {
+  if (-not $script:Odgoda) { return }
+  $o = $script:Odgoda
+  $script:Odgoda = $null
+  if ($o.Vrsta -eq 'text') {
+    if (Postavi-Tekst $o.Sadrzaj) {
+      Log ("  <- (odgodjeni) tekst {0} B" -f ([Text.Encoding]::UTF8.GetByteCount($o.Sadrzaj)))
+      Zapamti-Poznati @{ Vrsta = 'text'; Tekst = $o.Sadrzaj }
+    }
+  } elseif ($o.Vrsta -eq 'image') {
+    if (Postavi-Sliku $o.Sadrzaj) {
+      Log ("  <- (odgodjena) slika {0} B" -f $o.Sadrzaj.Length)
+      Zapamti-Trenutni ('I' + (Hash ([Convert]::ToBase64String($o.Sadrzaj))))
+    }
+  }
+}
+
 # ------------------------------------------------------------ slanje datoteke
 function Send-Datoteku($stream, [string]$putanja, [string]$rel = '') {
   $fi = Get-Item -LiteralPath $putanja -ErrorAction Stop
@@ -704,9 +960,33 @@ function Posalji-Grupu($stream, $grupa) {
 # --------------------------------------------------------- primanje datoteke
 function Zavrsi-Primanje($rx, $stream) {
   if (-not $rx) { return }
+  $cekao = $rx.Ceka
+  $rx.Ceka = $false
+  # Datoteka koja je cekala na lijepljenje unaprijed je dobila PUNU velicinu iz
+  # najave (vidi Novi-Prijem). Ako je stiglo manje bajtova nego sto je najavljeno
+  # - veza je pukla - rep bi ostao same nule. Zato se duljina svodi na ono sto
+  # je stvarno primljeno. Kroz drzac, pa radi i ako je datoteka u meduvremenu
+  # premjestena na odrediste.
+  if ($rx.Lijepi -and $rx.Got -lt $rx.Ocekivano) {
+    try { $rx.Fs.SetLength([int64]$rx.Got) } catch { }
+  }
   try { if ($rx.Fs) { $rx.Fs.Dispose() } } catch { }
   $script:Rx = $null
   Log ("  <- datoteka {0}  ({1} B)" -f (Split-Path $rx.Putanja -Leaf), $rx.Got)
+
+  # Datoteka koja je cekala na lijepljenje: meduspremnik je postavljen JOS NA
+  # POCETKU prijenosa (vidi Novi-Prijem), pa se ovdje NE postavlja ponovno -
+  # korisnik je ili vec zalijepio ili ce zalijepiti, a novo postavljanje bi
+  # popis putanja vratilo na ono sto je ostalo u Primljenom.
+  #
+  # Do ovoga u praksi dolazi samo sa starijim hostom koji PAUZU ignorira i
+  # prijenos dovrsi prije nego je korisnik stigao zalijepiti.
+  if ($rx.Lijepi) {
+    if ($cekao) { Log ("  [.] prijenos je zavrsio dok se cekalo na lijepljenje - putanja ostaje u Primljeno\") }
+    if ($rx.Grupa -and $rx.Grupa.Preostalo -le 0) { $script:Grupa = $null }
+    return
+  }
+
   if ($rx.ClipGrupa -and $rx.Grupa -and $rx.Grupa.Preostalo -le 0) {
     if (Postavi-Datoteke $rx.Grupa.Putanje) {
       Log ("  <- u meduspremnik stavljeno {0} datoteka" -f $rx.Grupa.Putanje.Count)
@@ -756,8 +1036,17 @@ if (-not $PSBoundParameters.ContainsKey('AllowedClients')) {
   }
 }
 
+# $MyInvocation.MyCommand.Path je prazan kad se tijelo skripte izvodi iz
+# scriptblocka (npr. kod -SelfTest ili kad se skripta posalje kroz vezu i
+# pokrene iz stringa). Tada je i $PSCommandPath prazan, pa se putanja skripte
+# uopce ne moze izvesti - ostaje $PSScriptRoot ili nista. NAMJERNO se ne
+# koristi $MyInvocation.MyCommand.Definition: u scriptblocku to vrati CIJELO
+# tijelo skripte, a ne putanju, pa Split-Path pukne na "nelegalnom znaku".
+# $skripte treba samo -Install (VBS omotac), a on se uvijek izvodi iz prave
+# datoteke - zato je prazan $skripte ovdje bezopasan.
 $self = $MyInvocation.MyCommand.Path
-$skripte = Split-Path $self -Parent
+if (-not $self) { $self = $PSCommandPath }
+$skripte = if ($self) { Split-Path $self -Parent } else { $PSScriptRoot }
 
 if ($Uninstall) {
   Unregister-ScheduledTask -TaskName $zadatak -Confirm:$false -ErrorAction SilentlyContinue
@@ -1035,6 +1324,57 @@ $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
   $isti = (Test-Path $odred) -and
           ((Get-FileHash $izvor -Algorithm MD5).Hash -eq (Get-FileHash $odred -Algorithm MD5).Hash)
   T 'sadrzaj datoteke identican (MD5)' $isti
+
+  # 3b. JEZGRO cekanja na lijepljenje. Cijeli mehanizam stoji na jednom:
+  #     datoteka otvorena za pisanje mora prezivjeti PREIMJESTANJE, a nas
+  #     drzac mora nastaviti pisati u nju na novom mjestu. Explorer zalijepljenu
+  #     datoteku na istom disku samo preimenuje, pa se time i dokazuje da je
+  #     korisnik zalijepio (putanja iz Primljenog nestane).
+  #
+  #     Ako ovo padne, pada i cijela zamisao - zato se provjerava izricito, a
+  #     ne prepusta vjeri u dokumentaciju.
+  $lz   = Join-Path $tmp 'lazy-izvor.bin'
+  $lzKamo = Join-Path $tmp 'lazy-odrediste.bin'
+  [System.IO.File]::WriteAllBytes($lz, (New-Object byte[] 1024))
+  $lzFs = New-Object System.IO.FileStream -ArgumentList @(
+    $lz, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write,
+    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+  $lzFs.SetLength(4096)
+  T 'velicina se rezervira prije prijenosa' ((Get-Item -LiteralPath $lz).Length -eq 4096)
+  [System.IO.File]::Move($lz, $lzKamo)
+  T 'datoteka se dala premjestiti dok je drzac otvoren' (Test-Path -LiteralPath $lzKamo)
+  $lzFs.Write([byte[]](1,2,3,4), 0, 4)
+  $lzFs.Flush()
+  # Citanje MORA ici kroz FileShare.ReadWrite. Nas drzac drzi datoteku otvorenu
+  # za pisanje, a [System.IO.File]::ReadAllBytes trazi FileShare.Read - s nasim
+  # drzacem se to ne poklapa i pukne na "datoteka je u upotrebi". Isti uvjet
+  # vrijedi za svakoga tko zeli citati sadrzaj dok prijenos traje (npr.
+  # antivirus ili preglednik minijatura) - zato je drzac otvoren s ReadWrite.
+  $lzCit = New-Object System.IO.FileStream -ArgumentList @(
+    $lzKamo, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+  $lzPrvi = $lzCit.ReadByte()
+  $lzCit.Dispose()
+  T 'pisanje ide u PREMJESTENU datoteku' ($lzPrvi -eq 1)
+  $lzFs.SetLength(4)
+  $lzFs.Flush()
+  T 'skracivanje kroz drzac radi i nakon premjestanja' ((Get-Item -LiteralPath $lzKamo).Length -eq 4)
+  $lzPut = Putanja-Rukovanja $lzFs
+  if ($lzPut) {
+    T 'putanja iz drzaca pokazuje na premjestenu datoteku' ($lzPut -like '*lazy-odrediste.bin')
+  } else {
+    Say '  [..]   putanja iz drzaca nije dostupna - ukras u dnevniku, nije greska'
+  }
+  $lzFs.Dispose()
+
+  # 3c. PAUZA / NASTAVI kroz pravi spoj
+  Send-Frame $b 0x30 (Utf8 (Json-Ukratko @{ name = 'x.iso'; size = 123 }))
+  $f = Receive-Frame $a
+  $fh = if ($f.Tip -eq 0x30) { [Text.Encoding]::UTF8.GetString($f.Payload) | ConvertFrom-Json } else { $null }
+  T 'okvir PAUZA nosi ime i velicinu' (($f.Tip -eq 0x30) -and ($fh.name -eq 'x.iso') -and ([int64]$fh.size -eq 123))
+  Send-Frame $b 0x31 @()
+  $f = Receive-Frame $a
+  T 'okvir NASTAVI' ($f.Tip -eq 0x31)
 
   # 4. imena
   T 'ime bez putanje' ((Ocisti-Ime 'C:\a\b\zlo.txt') -eq 'zlo.txt')
@@ -1357,8 +1697,14 @@ function Vrti-Klijenta {
 
 # ------------------------------------------------------------------ sync loop
 function Sync-Loop($klijent, $stream, [string]$uloga) {
+  # Ostatak prijenosa iz PROSLOG spoja: ako je veza pukla usred primanja,
+  # drzac je ostao otvoren. Bez ovoga bi se na svakom prekidu izgubio jedan
+  # drzac datoteke - a kod cekanja na lijepljenje i datoteka puna nula koja
+  # nikad ne ode.
+  if ($script:Rx -and $script:Rx.Fs) { try { $script:Rx.Fs.Dispose() } catch { } }
   $script:Rx    = $null      # datoteka koja se upravo prima
   $script:Grupa = $null      # grupa koja se upravo prima (za meduspremnik)
+  $script:Odgoda = $null     # tekst/slika koji cekaju kraj pauze (vidi Odgodi-Meduspremnik)
   $zadnjiDrop = @{}          # sto je iz Drop-a vec poslano (ime|duljina|vrijeme)
   $script:ZadnjiHash = Prezivjeli-Hash (Dohvati-Meduspremnik)
   $script:PreskociDo = [datetime]::MinValue
@@ -1370,6 +1716,18 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
     # klijent ostao u petlji nad zatvorenom uticnicom - vidi Test-Veza.
     if (-not (Test-Veza $klijent $stream)) { throw 'veza zatvorena' }
 
+    # ---- 0. je li korisnik zalijepio?
+    #
+    # Provjera ide prije svega ostaloga: dok se ceka, posiljatelj je zaustavljen
+    # pa ionako nema dolaznog prometa, a sto se prije posalje NASTAVI to prije
+    # krece pravi prijenos. Kad pauze nema, funkcija odmah izlazi.
+    if ($script:Rx -and $script:Rx.Ceka) {
+      Provjeri-Lijepljenje $script:Rx $stream
+    }
+    # Odgodjeni tekst/slika se primjenjuju cim pauze vise nema. Provjera ide
+    # svaki okretaj, a funkcija odmah izlazi kad nema nista odgodjeno.
+    if (-not ($script:Rx -and $script:Rx.Ceka)) { Primijeni-Odgodu }
+
     # ---- 1. dolazno
     try {
       $iter = 0
@@ -1380,7 +1738,11 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           0x10 {
             $t = [Text.Encoding]::UTF8.GetString($f.Payload)
             if ($t.Length -le $MaxTextBytes) {
-              if (Postavi-Tekst $t) {
+              # Dok se ceka na lijepljenje, meduspremnik drzi putanju datoteke
+              # koju korisnik upravo lijepi - tekst preko toga pojede upravo to.
+              if ($script:Rx -and $script:Rx.Ceka) {
+                Odgodi-Meduspremnik 'text' $t
+              } elseif (Postavi-Tekst $t) {
                 $p = if ($t.Length -gt 40) { $t.Substring(0,40) + '...' } else { $t }
                 Log ("  <- tekst {0} B  {1}" -f $f.Payload.Length, ($p -replace '\r?\n',' '))
                 Zapamti-Poznati @{ Vrsta = 'text'; Tekst = $t }
@@ -1389,7 +1751,9 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           }
           0x11 {
             if ($f.Payload.Length -le $MaxImageBytes) {
-              if (Postavi-Sliku $f.Payload) {
+              if ($script:Rx -and $script:Rx.Ceka) {
+                Odgodi-Meduspremnik 'image' $f.Payload
+              } elseif (Postavi-Sliku $f.Payload) {
                 Log ("  <- slika {0} B" -f $f.Payload.Length)
                 # Slika zadrzava ponovno citanje, ali uz poznati hash kao
                 # rezervu ako citanje vrati 'N' - vidi Zapamti-Trenutni.
@@ -1405,12 +1769,9 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           0x20 {
             $h = [Text.Encoding]::UTF8.GetString($f.Payload) | ConvertFrom-Json
             $odred = Odredi-Odrediste $h
-            $fs = [System.IO.File]::Open($odred, 'Create', 'Write')
-            $script:Rx = @{
-              Fs = $fs; Putanja = $odred; Got = 0; Ocekivano = [int64]$h.size
-              Grupa = $script:Grupa
-              ClipGrupa = ($null -ne $script:Grupa)
-            }
+            # Novi-Prijem odlucuje hoce li se na ovu datoteku cekati Ctrl+V, i
+            # ako hoce - odmah postavlja meduspremnik i salje PAUZU.
+            $script:Rx = Novi-Prijem $odred $h $stream
             if ($script:Grupa) { $script:Grupa.Putanje += $odred }
           }
           0x21 {
@@ -1425,6 +1786,17 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
               Zavrsi-Primanje $rx $stream
             }
           }
+          0x30 {
+            # PAUZA koju je poslao sugovornik - a ovaj most je ovdje POSILJATELJ.
+            # Cekanje je dogovoreno za onu stranu koja prima datoteku, pa se ovdje
+            # nema sto zaustavljati: nas prijenos u tom trenutku uopce ne traje
+            # (jedna veza, jedan prijenos u jednom smjeru). Zapisuje se da se u
+            # dnevniku vidi tko je trazio pauzu.
+            Log ("  [.] sugovornik je trazio pauzu - ne saljem dok ne kaze NASTAVI")
+          }
+          0x31 {
+            Log ("  [.] sugovornik je rekao NASTAVI")
+          }
           default { Log ("  [!] nepoznat tip okvira {0}" -f $f.Tip) }
         }
       }
@@ -1432,7 +1804,15 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
       catch { throw }
 
     # ---- 2. odlazno: meduspremnik
-    if (-not $NoClipboard -and (Get-Date) -gt $script:PreskociDo) {
+    #
+    # Dok se ceka na lijepljenje ovaj je meduspremnik ZAUZET: u njemu je putanja
+    # datoteke koju korisnik upravo lijepi (vidi Novi-Prijem). Slanje onoga sto
+    # je u njemu u tom trenutku poslalo bi tu istu putanju natrag, a na drugoj
+    # bi strani to postalo novi sadrzaj njezinog meduspremnika. Hash se zato ne
+    # trosi - sve sto je korisnik kopirao za vrijeme pauze ide van odmah nakon
+    # sto ona zavrsi.
+    if (-not $NoClipboard -and (Get-Date) -gt $script:PreskociDo -and
+        -not ($script:Rx -and $script:Rx.Ceka)) {
       $s = Dohvati-Meduspremnik
       $h = Prezivjeli-Hash $s
       if ($h -ne $script:ZadnjiHash -and $h -ne 'N') {

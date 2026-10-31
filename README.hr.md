@@ -364,6 +364,14 @@ verzijom Sunshinea i Moonlighta. Prenosi:
 
 Most zamjenjuje stari `clipboard-bridge.ps1`, koji je prenosio samo tekst.
 
+**Velika datoteka: prijenos počinje na Ctrl+V.** `Ctrl+C` samo najavi datoteku — bajtovi
+kreću tek kad se zalijepi, jer se time zna i odredište. Za datoteku veću od 8 MB VM odmah
+stvori na odredištu datoteku točne veličine i stavi ju u međuspremnik, pa `Ctrl+V` radi
+odmah (kod ISO-a od 6,5 GB prije je trebalo čekati 3 min 19 s). U prozoru napretka na hostu
+tada piše `čeka se lijepljenje (Ctrl+V)`, a nakon lijepljenja prijenos ide punom brzinom
+točno na odabrano mjesto. Lijepi **unutar istog diska** — na drugi disk Explorer kopira
+umjesto premješta, pa kopija nastane dok je datoteka još prazna.
+
 ### Koja strana sluša
 
 **Host sluša, VM se spaja.** Host na *Default Switchu* ima fiksnu adresu; adresa VM-a se

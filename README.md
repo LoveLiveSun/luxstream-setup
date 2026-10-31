@@ -264,6 +264,15 @@ TCP, so it works with any Sunshine and Moonlight version:
 | **file copied in Explorer** | Ctrl+C on a file, Ctrl+V on the other side pastes the file itself |
 | **file via a folder** | drop it into `%USERPROFILE%\Luxstream\Drop\`; it leaves that folder and appears in `Luxstream\Primljeno\` on the other side |
 
+**A large file starts moving on Ctrl+V.** Ctrl+C only announces the file — the bytes
+begin moving when it is pasted, because that is when the destination is known. Above
+8 MB the VM immediately creates the destination at its full size and puts it on the
+clipboard, so Ctrl+V works right away (a 6.5 GB ISO used to take 3 min 19 s). The host's
+progress window then shows `čeka se lijepljenje (Ctrl+V)`, and after the paste the
+transfer runs at full speed straight into the chosen location. Paste **within the same
+volume** — across volumes Explorer copies instead of moving, and that copy is taken
+while the file is still empty.
+
 ### Host listens, VM connects
 
 The host on the *Default Switch* has a **fixed** address; a VM's address changes (DHCP,
