@@ -88,8 +88,8 @@
                          ide ravno u Primljeno\. Stariji sugovornik ga ignorira.
         0x21  F_KOMAD    sirovi bajtovi (komad od ChunkBytes)
         0x22  F_KRAJ     prazno
-        0x30  PAUZA      UTF-8 JSON  { name, size }   (suvisno - samo se biljezi)
-        0x31  NASTAVI    prazno                       (suvisno - samo se biljezi)
+        0x30  PAUZA      UTF-8 JSON  { name, size }   - primalac trazi pauzu
+        0x31  NASTAVI    prazno                       - primalac javlja da cita
 
     POPIS sluzi da se nakon cijele grupe primljene datoteke mogu staviti u
     meduspremnik - tako "copy file" u Exploreru na jednoj strani zavrsi kao
@@ -160,8 +160,31 @@
     Stariji sugovornik (host koji ne zna da zaglavlja idu prva) salje
     zaglavlje pa odmah sadrzaj te datoteke; most i tada radi, samo se na
     opisnik ceka do kraja prijenosa - ponasanje se svodi na staro, bez greske.
-    Okviri 0x30 i 0x31 su sada suvisni (kanal ih ne koristi): primaju se i
-    biljeze, a u smjeru slanja se ne salju.
+
+    ==========================================================================
+    PAUZA / NASTAVI - prijenos krece tek na Ctrl+V (01.11.2026., vraceno)
+    ==========================================================================
+    Opisnik se u meduspremnik stavlja rano - cim stignu zaglavlja - pa je
+    prijenos sadrzaja mogao krenuti prije nego korisnik uopce pritisne Ctrl+V.
+    Kod velikih datoteka to znaci da veza radi punom brzinom bez potrebe, a
+    korisnik koji zalijepi prije kraja dobije krnju datoteku. Zato se na
+    trenutak kad je opisnik postavljen veza ZAUSTAVLJA:
+
+      1. Ovaj most salje 0x30 (PAUZA) - host prestane slati sadrzaj.
+         Zaglavlja su vec prosla (mala su), pa je opisnik vec gotov; cekaju
+         se samo komadi 0x21.
+      2. Kad korisnik pritisne Ctrl+V, Explorer pozove Read na nasoj struji
+         (to je LuxShim.Citanja() > 0). To je jedini pouzdan dokaz da je
+         Ctrl+V stigao - "procitano" ne moze posluziti, jer dok veza stoji u
+         Primljeno\ nema ni jednog bajta.
+      3. Most salje 0x31 (NASTAVI) i prijenos krece punom brzinom. Struja
+         koja je cekala u Read-u odmah dobiva bajtove.
+
+    Ako host ne zna za 0x30/0x31 (starija verzija), okvir se ignorira i sve
+    radi kao prije - prijenos krece odmah. U tom slucaju se ne gubi nista osim
+    sto Ctrl+V treba stisnuti kasnije.
+    Iskljuciti se moze s -BezPauze (prijenos krece odmah, kao nekad).
+    Host ima i tvrdi rok od 15 min: ako nitko ne zalijepi, sam nastavi.
 
     ==========================================================================
     OGRANICENJA (namjerna)
@@ -217,6 +240,9 @@ param(
   # rok za cijelu grupu, a ne za pojedinu datoteku - pa mora biti velik.
   [int]$LazyCekajSec = 600,
   [switch]$NoLazy,                                # iskljuci cijeli mehanizam
+  # Iskljuci PAUZU: prijenos krece odmah (Ctrl+C), kao prije. Korisno za
+  # usporedbu i za slucaj da sugovornik ne zna za 0x30/0x31.
+  [switch]$BezPauze,
 
   [switch]$DopustiVatru,                          # uz -Install -Mode Server: otvori port sada
 
@@ -458,7 +484,16 @@ namespace LuxShim
         [DllImport("ole32.dll", ExactSpelling = true)]
         internal static extern int OleGetClipboard(out IntPtr ppDataObj);
 
-        [DllImport("ole32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegisterClipboardFormatW")]
+        // POZOR: RegisterClipboardFormat zivi u user32.dll, NE u ole32.dll.
+        // OleSetClipboard/OleGetClipboard su iz ole32 (pa je lako svima njima
+        // pripisati i ovaj), ali ole32 ga NE izvozu. Krivi DllImport se ne vidi
+        // pri sastavljanju - puca tek u trenutku kad se opisnik stvarno stavlja
+        // na meduspremnik, kao EntryPointNotFoundException:
+        //   "无法在 DLL ole32.dll 中找到名为 RegisterClipboardFormatW 的入口点"
+        // a to je tocno onaj trenutak kad korisnik kopira datoteku, pa kanal
+        // izgleda mrtav iako je sve ostalo u redu. (Vidjeno u VM-u 01.11.2026.,
+        // pri kopiranju datoteke od 4,6 GB.)
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegisterClipboardFormatW")]
         internal static extern uint RegisterClipboardFormat(string lpszFormat);
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -621,6 +656,7 @@ namespace LuxShim
         private int _indeks;
         private long _vel;
         private bool _javljeno;
+        private bool _pocelo;
         private DateTime _cekanjeOd;
 
         public LuxStream(string put, int indeks, long vel)
@@ -646,6 +682,17 @@ namespace LuxShim
 
         public void Read(byte[] pv, int cb, IntPtr pcbRead)
         {
+            // Prvi Read ove datoteke = cilj je poceo povlaciti sadrzaj, tj.
+            // korisnik je zalijepio. Javlja se PRIJE citanja: most na to
+            // salje NASTAVI i prijenos tek tada krece (vidi Provjeri-Opisnik).
+            // Ako se to ne bi javilo, veza bi ostala zaustavljena i Read bi
+            // vjecno cekao u petlji nize - mrtva petlja, bez ijedne greske.
+            if (!_pocelo)
+            {
+                _pocelo = true;
+                LuxClip.OznaciCitanje();
+            }
+
             while (true)
             {
                 int n = _fs.Read(pv, 0, cb);
@@ -969,6 +1016,12 @@ namespace LuxShim
         private static int[] _gotovo;
         private static int _broj;
         private static int _procitano;
+        // Koliko je PUTA cilj uopce pozvao Read - dakle koliko je datoteka
+        // pocelo izlaziti. Ovo je signal za PAUZU/NASTAVI: dok je veza
+        // zaustavljena, u Primljeno\ jos nema ni jednog bajta, pa se po
+        // kolicini procitanoga ne moze znati je li korisnik zalijepio.
+        // Prvi Read je ono sto dokazuje da je Ctrl+V stigao.
+        private static int _citanja;
         private static volatile bool _lijepljeno;
         private static volatile bool _isteklo;
 
@@ -986,6 +1039,7 @@ namespace LuxShim
                 _gotovo = new int[ss.Length];
                 _broj = ss.Length;
                 _procitano = 0;
+                _citanja = 0;
                 _lijepljeno = false;
                 _isteklo = false;
                 _greska = null;
@@ -1096,6 +1150,16 @@ namespace LuxShim
             if (Interlocked.Exchange(ref _oznaka[i], 1) == 0)
                 Interlocked.Increment(ref _procitano);
         }
+
+        // Prvi poziv Read za ovu datoteku. Biljezi se PRIJE citanja, jer je
+        // samo poziv dokaz da je cilj poceo povlaciti sadrzaj - a to je jedini
+        // pouzdan znak da je korisnik pritisnuo Ctrl+V.
+        internal static void OznaciCitanje()
+        {
+            Interlocked.Increment(ref _citanja);
+        }
+
+        public static int Citanja() { return _citanja; }
 
         // Javlja da je prijenos te datoteke gotov - od tog trenutka LuxStream
         // vise ne ceka na rast datoteke, nego na pitanje "ima li jos" odgovara
@@ -1587,7 +1651,7 @@ function Novi-Prijem([string]$odred, $zag) {
 # velicinu svake datoteke, pa se prije toga ne moze sastaviti. Host zaglavlja
 # salje prva, jedno za drugim, pa je taj trenutak rano - ne ceka se ni jedan
 # bajt sadrzaja (vidi zaglavlje skripte).
-function Postavi-Opisnik($grupa) {
+function Postavi-Opisnik($grupa, $stream) {
   if ($NoLazy -or -not $script:LuxTip) { return }
   if (-not $grupa) { return }
   if ($grupa.Ocekivano -le 0) { return }
@@ -1621,6 +1685,28 @@ function Postavi-Opisnik($grupa) {
   $grupa.SmirenjeOd = $null
   Log ("  <- meduspremnik spreman: {0} datoteka ({1} MB) - Ctrl+V ih lijepi sve odjednom" -f `
          $grupa.Stavke.Count, [math]::Round($uk / 1MB, 1))
+
+  # --- PAUZA: veza stane dok korisnik ne pritisne Ctrl+V --------------------
+  #
+  # Opisnik je gotov i stoji u meduspremniku, pa sadrzaj ne treba nigdje
+  # zuriti. Host se zaustavlja, a mi cekamo prvi Read na nasoj struji - to je
+  # Provjeri-Opisnik. Bez ovoga bi 6,5 GB islo preko veze u prazno, a korisnik
+  # koji zalijepi prije kraja dobio bi krnju datoteku.
+  #
+  # Ako sugovornik ne zna za 0x30, okvir se ignorira i sve radi kao prije.
+  $grupa.Pauza = $false
+  $grupa.Nastavljeno = $false
+  if (-not $BezPauze -and $stream) {
+    $grupa.Pauza = $true
+    try {
+      $prva = $grupa.Stavke[0]
+      Send-Frame $stream 0x30 (Utf8 (Json-Ukratko @{ name = [string]$prva.Ime; size = [int64]$prva.Vel }))
+      Log '  -> pauza: cekam Ctrl+V prije nego krene sadrzaj'
+    } catch {
+      $grupa.Pauza = $false
+      Log ("  [!] pauzu nisam mogao poslati: " + $_.Exception.Message)
+    }
+  }
 }
 
 # Je li grupa zalijepljena, i je li vrijeme da se kanal zatvori i pocisti?
@@ -1630,7 +1716,7 @@ function Postavi-Opisnik($grupa) {
 # bajt svake datoteke, pa Stanje() prijede u 3. Tek tada - i to nakon kratkog
 # predaha, da cilj stigne zapisati u odrediste - kanal se zatvara i
 # Primljeno\ cisti.
-function Provjeri-Opisnik($grupa) {
+function Provjeri-Opisnik($grupa, $stream) {
   if (-not $grupa -or -not $grupa.Opisnik -or -not $script:LuxTip) { return }
 
   $sada = Get-Date
@@ -1640,6 +1726,27 @@ function Provjeri-Opisnik($grupa) {
     $stanje = [LuxShim.LuxClip]::Stanje()
     $lijepljeno = [LuxShim.LuxClip]::Lijepljeno()
   } catch { }
+
+  # --- NASTAVI: je li korisnik zalijepio? -----------------------------------
+  #
+  # Dok veza stoji, u Primljeno\ nema ni jednog bajta, pa se po kolicini
+  # procitanoga NE moze znati je li Ctrl+V stigao (Stanje() bi bio 1 sve do
+  # kraja). Zna se po tome sto je cilj uopce pozvao Read na nasoj struji:
+  # LuxShim to broji u Citanja(). Tek tada ima smisla pustiti bajtove.
+  if ($grupa.Pauza -and -not $grupa.Nastavljeno -and $stream) {
+    $citanja = 0
+    try { $citanja = [LuxShim.LuxClip]::Citanja() } catch { }
+    if ($citanja -gt 0) {
+      $grupa.Nastavljeno = $true
+      try {
+        Send-Frame $stream 0x31 @()
+        Log ("  <- zalijepljeno - nastavljam prijenos (pauza {0} s)" -f `
+               [int]($sada - $grupa.OpisnikOd).TotalSeconds)
+      } catch {
+        Log ("  [!] NASTAVI nisam mogao poslati: " + $_.Exception.Message)
+      }
+    }
+  }
 
   if ($stanje -eq 3 -or $lijepljeno) {
     if (-not $grupa.SmirenjeOd) { $grupa.SmirenjeOd = $sada }
@@ -2136,6 +2243,20 @@ $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
   $hS = $psS.BeginInvoke()
   T 'saljilac dobiva prave funkcije' (($kod -match 'function Send-Datoteku') -and ($kod -match 'function Send-Frame'))
 
+  # 2b. PAUZA / NASTAVI u smjeru slanja. Provjerava se tijelo funkcija, a ne
+  #     datoteka s diska - tako ovo radi i kad se skripta pokrene iz bloka.
+  #     Ako PAUZA nedostaje, prijenos krece na Ctrl+C (staro ponasanje). Ako
+  #     NASTAVI nedostaje, veza ostane zaustavljena ZAUVIJEK: opisnik ceka
+  #     Ctrl+V, a bajtovi nikad ne krenu - mrtva veza bez ijedne greske.
+  $tPauza = ''
+  $tNast  = ''
+  try { $tPauza = (Get-Command Postavi-Opisnik  -CommandType Function).Definition } catch { }
+  try { $tNast  = (Get-Command Provjeri-Opisnik -CommandType Function).Definition } catch { }
+  T 'pauza: most salje PAUZU kad je opisnik gotov' `
+    (($tPauza -match 'Send-Frame \$stream 0x30') -and ($tPauza -match 'BezPauze'))
+  T 'pauza: NASTAVI ide na prvi Read (Citanja)' `
+    (($tNast -match 'Send-Frame \$stream 0x31') -and ($tNast -match 'Citanja\(\)'))
+
   try {
     $zag = Receive-Frame $a
     T 'F_POCETAK' ($zag.Tip -eq 0x20)
@@ -2179,6 +2300,13 @@ $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     Say ('  [!] ' + $script:LuxGreska)
   } else {
     T 'kanal: LuxShim se sastavio' $true
+
+    # Citanja() je jedini pouzdan dokaz da je korisnik zalijepio: dok veza
+    # stoji, u Primljeno\ nema bajtova, pa se po kolicini procitanoga ne moze
+    # zakljuciti nista. Ako ove metode nema, most posalje PAUZU i ceka vjecno.
+    $okCitanja = $false
+    try { [void][LuxShim.LuxClip]::Citanja(); $okCitanja = $true } catch { }
+    T 'kanal: brojanje citanja (signal za NASTAVI)' $okCitanja
 
     # Dvije datoteke, namjerno razlicite: prva mala, druga iznad 4 GB - da se
     # vidi da nFileSizeHigh nije uvijek nula (tamo se lomi najlakse).
@@ -2638,7 +2766,7 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
     # ionako salje punom brzinom, pa nema sto cekati - a sto se prije primijeti
     # kraj citanja, to se prije kanal zatvori i Primljeno\ pocisti.
     if ($script:Grupa -and $script:Grupa.Opisnik) {
-      Provjeri-Opisnik $script:Grupa
+      Provjeri-Opisnik $script:Grupa $stream
     }
     # Odgodjeni tekst/slika se primjenjuju cim kanal vise nije zauzet. Provjera
     # ide svaki okretaj, a funkcija odmah izlazi kad nema nista odgodjeno.
@@ -2743,7 +2871,7 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
 
             # Ako je ovo zadnje zaglavlje grupe, kanal se otvara odmah - ne
             # ceka se ni jedan bajt sadrzaja.
-            Postavi-Opisnik $grupa
+            Postavi-Opisnik $grupa $stream
           }
           0x21 {
             if (-not $script:Rx) { throw 'komad bez najave datoteke' }
