@@ -88,17 +88,17 @@
                          ide ravno u Primljeno\. Stariji sugovornik ga ignorira.
         0x21  F_KOMAD    sirovi bajtovi (komad od ChunkBytes)
         0x22  F_KRAJ     prazno
-        0x30  PAUZA      UTF-8 JSON  { name, size }   primaoc -> posiljatelj
-        0x31  NASTAVI    prazno                       primaoc -> posiljatelj
+        0x30  PAUZA      UTF-8 JSON  { name, size }   (suvisno - samo se biljezi)
+        0x31  NASTAVI    prazno                       (suvisno - samo se biljezi)
 
     POPIS sluzi da se nakon cijele grupe primljene datoteke mogu staviti u
     meduspremnik - tako "copy file" u Exploreru na jednoj strani zavrsi kao
     paste datoteke na drugoj, bez ikakvog rucnog koraka.
 
     ==========================================================================
-    PAUZA / NASTAVI - zasto postoje (dodano 01.11.2026.)
+    KANAL ZA DATOTEKE - zasto Ctrl+V pokrece prijenos (01.11.2026.)
     ==========================================================================
-    Prije se prijenos pokretao Ctrl+C-om: cim se kopiranje primijeti, ovaj most
+    Prije se prijenos pokretao Ctrl+C-om: cim se kopiranje primijeti, most
     posalje najavu grupe i odmah pocne prenositi bajtove, a meduspremnik na
     drugoj strani postavi TEK kad zadnji bajt sleti. Posljedica se mjerila u
     stvarnim dnevnicima: kod ISO datoteke od 6,5 GB meduspremnik je bio gotov
@@ -107,45 +107,61 @@
     ono sto je u tom trenutku u meduspremniku (stari sadrzaj), a datoteka nikad
     ne zavrsi tamo gdje je htjela. Upravo je to bio "prvi Ctrl+V ne radi".
 
-    Sada radi obrnuto - Ctrl+V pokrece prijenos:
+    Sada meduspremnik ne nosi PUTANJU (CF_HDROP), nego OPISNIK - isto ono sto
+    rade RDP i VMware:
 
-      1. Na F_POCETAK se na odredistu stvori datoteka VELICINE IZ NAJAVE
-         (SetLength, bez podataka) i meduspremnik se postavi ODMAH, s efektom
-         premjestanja. Od tog trenutka Ctrl+V radi - doslovno milisekunde
-         nakon Ctrl+C-a, bez obzira na velicinu.
-      2. Odmah se posalje PAUZA. Posiljatelj tada ZAUSTAVI slanje te datoteke.
-         Bez toga bi se datoteka na odredistu punila prije nego je korisnik
-         uopce odlucio kamo ide, a upravo je poanta da se bajtovi prenose tek
-         kad je odrediste poznato.
-      3. Drzac datoteke se otvara s dozvolom brisanja (FileShare.Delete), pa
-         Explorer zalijepljenu datoteku PREMJESTI (rename) na odrediste - a
-         nas otvoreni drzac je prati i dalje pise u istu datoteku, sad na
-         novom mjestu. Zato je nestanak putanje u Primljenom TOCAN signal
-         da je korisnik zalijepio.
-      4. Kad putanja nestane, posalje se NASTAVI i prijenos ide punom brzinom
-         u datoteku koja je vec tamo gdje ju je korisnik htio.
-      5. Ako nitko ne zalijepi unutar LazyCekajSec (zadano 10 min), salje se
-         NASTAVI i prijenos se dovrsava u Primljeno\ - tocno staro ponasanje,
-         nista se ne gubi.
+        FileGroupDescriptorW   popis: ime, velicina i vrijeme svake datoteke
+        FileContents           sadrzaj, po JEDAN po datoteci (bira ga "lindex")
+        Preferred DropEffect   1 = COPY
 
-    Cijena, svjesno prihvacena: dok se ceka, datoteka na odredistu stoji
-    pune velicine ali bez sadrzaja (sparse; cita se kao nule dok ne pocne
-    pisanje).
+    Time se jednim potezom rjesavaju dva problema:
 
-    VAZNO - lijepi unutar ISTOG diska. Kad se lijepi na drugi disk ili na
-    mrezu, Explorer premjestanje (MOVE) izvodi kao kopiranje + brisanje izvora.
-    Kopija tada nastane u trenutku lijepljenja, dakle dok je nasa datoteka jos
-    puna nula, a izvor se obrise - pa prijenos dalje ide u drzac koji pokazuje
-    na obrisanu datoteku i kopija na odredistu ostaje prazna. To se prepoznaje
-    po tome sto se putanja iz drzaca (GetFinalPathNameByHandleW) ne moze
-    procitati, i u dnevnik se zapise:
-      [!] zalijepljeno nakon N s, ali putanja iz drzaca nije citljiva ...
-    Primljeno\ i radna povrsina su po defaultu na C:, pa je ovo uobicajeni
-    slucaj i ne treba nista postavljati.
+      1. Cijela grupa ide odjednom. Opisnik nosi SVE datoteke, a Explorer za
+         svaku trazi svoj FileContents s rednim brojem. Jedan Ctrl+V zalijepi
+         cijelu mapu - prije je to mogla samo zadnja datoteka grupe.
+      2. Nema vise praznih datoteka pri lijepljenju na drugi disk. Sadrzaj
+         dolazi iz NASE struje, a ne s putanje koju Explorer preuzme, pa
+         Explorer nad izvorom ne radi nista (COPY, ne MOVE) i nema trenutka
+         u kojem kopira datoteku dok je ova jos prazna.
 
-    Stariji sugovornik (host bez 0x30/0x31) ove okvire odbaci kao nepoznate i
-    nastavi slati - ponasanje se svodi na staro, bez greske. Isto tako ovaj
-    most 0x30/0x31 u smjeru slanja samo zapise u dnevnik.
+    Kako ide, korak po korak:
+
+      1. Host prvo posalje SVA zaglavlja grupe (0x20), jedno za drugim, pa tek
+         onda sadrzaj. To je promjena i na hostu - bez nje bi se na opisnik
+         cekalo dok se ne prenese sve prije zadnje datoteke.
+      2. Kad su zaglavlja stigla, ovaj most sastavi opisnik i stavi ga u
+         meduspremnik (LuxShim). Zaglavlja dolaze prije sadrzaja, pa je to
+         rano - ne ceka se ni jedan bajt.
+      3. Datoteke se pune na disk kako komadi (0x21) pristizu. Struja
+         (FileContents) ih cita ODAVDE - ako cilj cita brze nego sto veza
+         dovodi, struja ceka (vidi LuxShim). Zato se nikad ne dobije krnja
+         datoteka, ni kod 6,5 GB.
+      4. Kraj je procitan zadnji bajt svake datoteke. Ctrl+V NE salje
+         CFSTR_PASTESUCCEEDED (to postoji samo u OLE drag&drop), pa se zna
+         drugacije: struja koja vrati 0 B je gotova.
+      5. Nakratko zatim kanal se povlaci (OleSetClipboard NULL) i Primljeno\
+         se cisti. Cilj je sve vec zapisao na svoje odrediste.
+
+    Zasto se NE flusha (OleFlushClipboard): on u meduspremnik upise samo
+    HGLOBAL mediume, a nas sadrzaj je IStream - proxy natrag u ovaj proces.
+    Flush bi dakle izgubio upravo ono sto nosimo. Zato meduspremnik drzi
+    proxy, a ovaj proces mora biti ziv dok cilj ne procita - i zato se u
+    Primljeno\ ne dira dok kanal stoji.
+
+    Zasto IStream, a ne HGLOBAL za sadrzaj: HGLOBAL je JEDAN komad memorije,
+    pa bi 10 GB ISO znacilo 10 GB u RAM-u. IStream se cita s diska na zahtjev.
+    HGLOBAL se ipak nudi kao rezerva (neki programi traze bas njega), ali se
+    isporucuje samo za male datoteke.
+
+    Ako nitko ne zalijepi unutar LazyCekajSec (zadano 10 min), kanal se
+    povlaci, a datoteke OSTAJU u Primljeno\ - nista se ne gubi i nista se ne
+    brise naslijepo.
+
+    Stariji sugovornik (host koji ne zna da zaglavlja idu prva) salje
+    zaglavlje pa odmah sadrzaj te datoteke; most i tada radi, samo se na
+    opisnik ceka do kraja prijenosa - ponasanje se svodi na staro, bez greske.
+    Okviri 0x30 i 0x31 su sada suvisni (kanal ih ne koristi): primaju se i
+    biljeze, a u smjeru slanja se ne salju.
 
     ==========================================================================
     OGRANICENJA (namjerna)
@@ -191,14 +207,14 @@ param(
   [switch]$NoClipboard,
   [switch]$NoFiles,
 
-  # --- cekanje na lijepljenje (vidi PAUZA / NASTAVI u zaglavlju) -------------
-  # Datoteka manja od ove se ne ceka: prijenos je gotov prije nego oko stigne
-  # do Ctrl+V-a, pa bi pauza samo odgodila nesto sto ionako ne stigne procitati.
-  # 0 znaci "cekaj svaku datoteku iz meduspremnika".
-  [int]$LazyMinMB = 8,
-  # Najdulje cekanje na lijepljenje prije nego se odustane i prijenos dovrsi
-  # u Primljeno\ na stari nacin. Host ima svoj, dulji rok (15 min) kao zastita
-  # od sugovornika koji umre usred pauze, pa ovaj mora biti kraci.
+  # --- cekanje na lijepljenje (vidi zaglavlje) -------------------------------
+  # Zadano je 0: meduspremnik se postavlja za SVAKU grupu iz meduspremnika.
+  # Novi kanal nosi opisnik cijele grupe i sve se datoteke postavljaju zajedno,
+  # pa bi prag samo znacio da male datoteke zavrse u Primljeno\ i tamo i ostanu.
+  # Vrijednost > 0 vraca staro ponasanje: ispod praga se ne ceka.
+  [int]$LazyMinMB = 0,
+  # Najdulje cekanje na lijepljenje prije nego se odustane. Ovo je ujedno i
+  # rok za cijelu grupu, a ne za pojedinu datoteku - pa mora biti velik.
   [int]$LazyCekajSec = 600,
   [switch]$NoLazy,                                # iskljuci cijeli mehanizam
 
@@ -326,9 +342,875 @@ function Daj-Mrezu {
 $script:StaRs = $null
 $script:PreskociDo = [datetime]::MinValue
 
-# Postavi na $true ako se Citac tipova za Putanja-Rukovanja nije mogao
-# sastaviti - tada se taj ukras u dnevniku preskace zauvijek (vidi tu funkciju).
-$script:LuxRukNema = $false
+# ------------------------------------------------- RDP kanal za datoteke ----
+# Zasto ovo postoji, i zasto bas ovako.
+#
+# Prije ovoga datoteke su isle ovako: primljena datoteka se na disku odmah
+# "unaprijed" napuhala na najavljenu velicinu (SetLength), pa se u
+# meduspremnik stavila Putanja te datoteke, a Explorer ju je pri Ctrl+V
+# PREMJESTIO. Dvije su posljedice bile nepopravljive:
+#
+#   1. Lijepljenje na DRUGI disk. Explorer "premjestanje" preko granice diska
+#      izvede kao kopiraj-pa-obrisi. Kopiranje procita datoteku u trenutku kad
+#      je ona jos puna nula, pa na odredistu ostane prazna datoteka - a nas
+#      drzac poslije pise u obrisanu datoteku. Prijenos "prodje", rezultat je
+#      0 bajtova. (Vidjeno 31.10.2026.)
+#
+#   2. Grupa s vise datoteka. Meduspremnik se nije smio mijenjati u pola
+#      grupe, pa je cekanje na Ctrl+V bilo moguce samo za JEDNU datoteku -
+#      onu koja stigne zadnja i to samo ako je veca od LazyMinMB. Ostale
+#      datoteke iz grupe zavrsile su u Primljeno\ i nikad nisu zalijepljene.
+#
+# Rjesenje je isto koje koristi RDP: meduspremnik ne nosi PUTANJE, nego
+# OPISNIK cijele grupe (FileGroupDescriptorW) i po jednu STRUJU sadrzaja za
+# svaku datoteku (CFSTR_FILECONTENTS). Time:
+#
+#   * Explorer ne dira nasu datoteku: sadrzaj cita iz nase struje i sam ga
+#     stvara na odredistu. Efekt je COPY, pa nema "kopiraj pa obrisi" i nema
+#     prazne datoteke ni na drugom disku.
+#   * Imena i podmape dolaze iz opisnika, pa se na odredistu dobije tocno
+#     ono sto je poslano - neovisno o tome kako se datoteka zove na disku.
+#   * CIJELA grupa ide u jednom Ctrl+V-u: jedan opisnik nosi sve datoteke.
+#   * Nema vise pogadanja je li korisnik zalijepio: struja se cita dok cilj
+#     ne procita zadnji bajt, pa se to tocno vidi.
+#
+# Cijena, svjesno prihvacena: datoteka se prvo mora primiti na disk (drugacije
+# se ne zna njezina velicina, a bez velicine opisnik ne vrijedi). Zato kod
+# velikih datoteka Ctrl+V treba stisnuti malo poslije - ali samo jednom, i
+# nikad se ne dobije krnja datoteka: struja ceka dok prijenos ne zavrsi.
+#
+# Sve sto dira OLE (IDataObject, IEnumFORMATETC, IStream, message pump) je u
+# ugnijezdjenom C# kodu nize. PowerShell ga samo poziva.
+#
+# NAPOMENA: meduspremnik se NE flusha. U njemu stoji proxy koji pokazuje
+# natrag na nas proces, pa ova nit mora biti ziva dok cilj ne procita - vidi
+# LuxClip.Ocisti i izlaz iz Sync-Loop.
+$script:LuxTip    = $false
+$script:LuxGreska = ''
+
+function Init-LuxClip {
+  if ($script:LuxTip) { return $true }
+  try {
+    Add-Type -TypeDefinition @'
+// LuxShim.cs -- RDP-ovski kanal za datoteke u meduspremniku.
+//
+// Sto se nudi meduspremniku:
+//   FileGroupDescriptorW  (CFSTR_FILEDESCRIPTORW)     HGLOBAL - popis datoteka
+//   FileContents          (CFSTR_FILECONTENTS)        IStream - sadrzaj po lindexu
+//   Preferred DropEffect  (CFSTR_PREFERREDDROPEFFECT) HGLOBAL - 1 = COPY
+//
+// Zasto opisnik, a ne CF_HDROP: CF_HDROP salje PUTANJE s nase strane, pa ime
+// i podmapu odreduje Explorer prema onome sto na disku zatekne. Opisnik salje
+// IMENA i VELICINE, a sadrzaj ide kroz nasu struju - pa se na odredistu dobije
+// tocno ono sto je poslano (i podmapa iz "rel"), neovisno o tome gdje se
+// datoteka stvarno nalazi i kako se zove.
+//
+// Zasto IStream, a ne HGLOBAL za sadrzaj: HGLOBAL je JEDAN komad memorije, pa
+// bi 10 GB ISO znacio 10 GB u RAM-u. IStream se cita s diska na zahtjev, pa
+// velicina datoteke ne odreduje potrosnju memorije. HGLOBAL ostaje ponuden kao
+// rezerva, jer neki programi traze bas njega.
+//
+// Zasto vlastita IDataObject, a ne System.Windows.Forms.DataObject: FORMATETC
+// nosi i "lindex", a upravo lindex bira KOJU datoteku iz grupe cilj trazi.
+// WinForms DataObject lindex uopce ne izlaze, pa se grupa po njemu ne moze
+// razluciti. Zato je IDataObject ovdje napisan rucno.
+//
+// NAPOMENA O ZIVOTU: meduspremnik se NE flusha (nema OleFlushClipboard).
+// Umjesto toga u meduspremniku stoji proxy koji pokazuje natrag na nas proces,
+// pa nas proces mora biti ziv dok cilj ne procita. To nam odgovara - most je
+// ionako stalno pokrenut - ali znaci i da se ova nit NE SMIJE ugasiti dok je
+// sto u meduspremniku.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text;
+using System.Threading;
+
+namespace LuxShim
+{
+    // ================================================================ Win32
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public int x;
+        public int y;
+    }
+
+    internal static class Win
+    {
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        internal static extern int OleInitialize(IntPtr pvReserved);
+
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        internal static extern void OleUninitialize();
+
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        internal static extern int OleSetClipboard(IntPtr pDataObj);
+
+        [DllImport("ole32.dll", ExactSpelling = true)]
+        internal static extern int OleGetClipboard(out IntPtr ppDataObj);
+
+        [DllImport("ole32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegisterClipboardFormatW")]
+        internal static extern uint RegisterClipboardFormat(string lpszFormat);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr GlobalLock(IntPtr hMem);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool GlobalUnlock(IntPtr hMem);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr GlobalFree(IntPtr hMem);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool PeekMessageW(out MSG lpMsg, IntPtr hWnd,
+            uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
+
+        [DllImport("user32.dll")]
+        internal static extern bool TranslateMessage(ref MSG lpMsg);
+
+        [DllImport("user32.dll")]
+        internal static extern IntPtr DispatchMessageW(ref MSG lpMsg);
+
+        internal const uint GMEM_MOVEABLE = 0x0002;
+        internal const uint PM_REMOVE    = 0x0001;
+    }
+
+    // ============================================================ OLE tipovi
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FORMATETC
+    {
+        public short  cfFormat;
+        public IntPtr ptd;
+        public int    dwAspect;
+        public int    lindex;
+        public int    tymed;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct STGMEDIUM
+    {
+        public int    tymed;
+        public IntPtr unionmember;
+        public IntPtr pUnkForRelease;
+    }
+
+    // IDataObject je ovdje deklariran rucno, a ne preko
+    // System.Runtime.InteropServices.ComTypes.IDataObject, jer ta verzija
+    // trazi IEnumADVISE koji u .NET Frameworku nije javan - pa se ta
+    // IDataObject uopce ne moze implementirati izvan mscorliba.
+    // IID je isti kao pravi, pa ole32 prepoznaje sucelje i marshalling radi.
+    [ComImport]
+    [Guid("0000010e-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IDataObjectRaw
+    {
+        [PreserveSig] int QueryGetData(ref FORMATETC pformatetc);
+        [PreserveSig] int GetData(ref FORMATETC pformatetcIn, out STGMEDIUM pmedium);
+        [PreserveSig] int GetDataHere(ref FORMATETC pformatetc, ref STGMEDIUM pmedium);
+        [PreserveSig] int GetCanonicalFormatEtc(ref FORMATETC pformatectIn, out FORMATETC pformatetcOut);
+        [PreserveSig] int SetData(ref FORMATETC pformatetc, ref STGMEDIUM pmedium,
+                                  [MarshalAs(UnmanagedType.Bool)] bool fRelease);
+        [PreserveSig] int EnumFormatEtc(int dwDirection, out IEnumFormatEtcRaw ppenumFormatEtc);
+        [PreserveSig] int DAdvise(ref FORMATETC pformatetc, int advf, IntPtr pAdviseSink,
+                                  out int pdwConnection);
+        [PreserveSig] int DUnadvise(int dwConnection);
+        [PreserveSig] int EnumDAdvise(out IntPtr ppenumAdvise);
+    }
+
+    [ComImport]
+    [Guid("00000103-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IEnumFormatEtcRaw
+    {
+        [PreserveSig] int Next(int celt,
+            [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 0)] FORMATETC[] rgelt,
+            IntPtr pceltFetched);
+        [PreserveSig] int Skip(int celt);
+        [PreserveSig] int Reset();
+        [PreserveSig] int Clone(out IEnumFormatEtcRaw ppenum);
+    }
+
+    internal static class Hr
+    {
+        internal const int S_OK           = 0;
+        internal const int S_FALSE        = 1;
+        internal const int E_NOTIMPL      = unchecked((int)0x80004001);
+        internal const int E_OUTOFMEMORY  = unchecked((int)0x8007000E);
+        internal const int E_INVALIDARG   = unchecked((int)0x80070057);
+        internal const int E_UNEXPECTED   = unchecked((int)0x8000FFFF);
+        internal const int DV_E_FORMATETC = unchecked((int)0x80040064);
+        internal const int DV_E_LINDEX    = unchecked((int)0x80040068);
+        internal const int DV_E_TYMED     = unchecked((int)0x80040069);
+        internal const int OLE_E_ADVISENOTSUPPORTED = unchecked((int)0x80040003);
+    }
+
+    internal static class For
+    {
+        internal const int DATADIR_GET     = 1;
+        internal const int DVASPECT_CONTENT = 1;
+        internal const int TYMED_HGLOBAL   = 1;
+        internal const int TYMED_ISTREAM   = 4;
+        internal const int TYMED_ISTORAGE  = 8;
+
+        // FILEDESCRIPTORW.dwFlags
+        internal const uint FD_ATTRIBUTES = 0x00000004;
+        internal const uint FD_WRITESTIME = 0x00000020;
+        internal const uint FD_FILESIZE   = 0x00000040;
+        internal const uint FD_UNICODE    = 0x80000000;
+
+        internal const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+
+        // FILEDESCRIPTORW je 592 bajta u Unicode inacici:
+        //   dwFlags 4 + clsid 16 + sizel 8 + pointl 8 + dwFileAttributes 4
+        //   + 3 x FILETIME 8 + nFileSizeHigh 4 + nFileSizeLow 4
+        //   + cFileName 260 WCHAR (520)  =  592
+        internal const int FD_SIZE        = 592;
+        internal const int FD_NAME_OFFSET = 72;
+
+        internal static short _fgdw = 0;
+        internal static short _fc   = 0;
+        internal static short _pdde = 0;
+        internal static short _pdd  = 0;
+        internal static short _psuc = 0;
+        private static readonly object _lok = new object();
+
+        // Registracija se kesira: RegisterClipboardFormat vraca isti broj za isto
+        // ime, ali svaki poziv je sistemski poziv, a ovdje se ide u petlji.
+        internal static void Registriraj()
+        {
+            lock (_lok)
+            {
+                if (_fgdw == 0) _fgdw = (short)Win.RegisterClipboardFormat("FileGroupDescriptorW");
+                if (_fc   == 0) _fc   = (short)Win.RegisterClipboardFormat("FileContents");
+                if (_pdde == 0) _pdde = (short)Win.RegisterClipboardFormat("Preferred DropEffect");
+                if (_pdd  == 0) _pdd  = (short)Win.RegisterClipboardFormat("Performed DropEffect");
+                if (_psuc == 0) _psuc = (short)Win.RegisterClipboardFormat("Paste Succeeded");
+            }
+        }
+    }
+
+    // ============================================================ jedna stavka
+    public class Stavka
+    {
+        internal string Put;   // gdje datoteka stvarno jest (Primljeno\...)
+        internal string Rel;   // ime u meduspremniku, s podmapom: "mapa/sub/x.txt"
+        internal long   Vel;
+    }
+
+    // ==================================================== IStream nad diskom
+    // Cita s diska na zahtjev. Kad zadnji bajt ode, javlja se u LuxClip - to
+    // je najbolji moguci signal da je cilj procitao cijelu datoteku, a Explorer
+    // pise u odrediste dok cita, pa je to ujedno i "gotovo".
+    [ComVisible(true)]
+    [ClassInterface(ClassInterfaceType.None)]
+    public class LuxStream : IStream
+    {
+        private FileStream _fs;
+        private int _indeks;
+        private long _vel;
+        private bool _javljeno;
+        private DateTime _cekanjeOd;
+
+        public LuxStream(string put, int indeks, long vel)
+        {
+            // FileShare.Delete je OBAVEZAN, i to iz drugog razloga nego prije:
+            // ovu struju nitko ne zatvara (OLE ju drzi preko svog proxyja do
+            // kraja), pa bi datoteka ostala zakljucana dok ju GC ne pokupi - a
+            // most je u meduvremenu zeli obrisati iz Primljeno\. Bez Delete u
+            // nacinu dijeljenja Remove-Item pukne na "datoteka je u upotrebi".
+            // Brisanje je sigurno: brise se tek kad su sve struje procitane do
+            // kraja i prodje predah (vidi Provjeri-Opisnik).
+            _fs = new FileStream(put, FileMode.Open, FileAccess.Read,
+                                 FileShare.ReadWrite | FileShare.Delete);
+            _indeks = indeks;
+            _vel = vel;
+            _cekanjeOd = DateTime.UtcNow;
+        }
+
+        ~LuxStream()
+        {
+            try { if (_fs != null) _fs.Dispose(); } catch { }
+        }
+
+        public void Read(byte[] pv, int cb, IntPtr pcbRead)
+        {
+            while (true)
+            {
+                int n = _fs.Read(pv, 0, cb);
+                if (n > 0)
+                {
+                    if (pcbRead != IntPtr.Zero) Marshal.WriteInt32(pcbRead, n);
+                    return;
+                }
+
+                // Kraj datoteke. Ako je najavljena veca velicina, a prijenos
+                // jos traje, ovdje se ceka: cilj (Explorer) cita u istoj petlji
+                // dok pise u odrediste, pa se datoteka na odredistu sastavi u
+                // jednom potezu i bez ijednog dodatnog Ctrl+V-a. Bez ovoga bi
+                // korisnik morao pogoditi trenutak kad je prijenos gotov.
+                bool cekaj = !LuxClip.JeGotov(_indeks)
+                          && _fs.Length < _vel
+                          && !LuxClip.JeKraj()
+                          && (DateTime.UtcNow - _cekanjeOd).TotalSeconds < 1800;
+
+                if (cekaj)
+                {
+                    Thread.Sleep(25);
+                    continue;
+                }
+
+                if (pcbRead != IntPtr.Zero) Marshal.WriteInt32(pcbRead, 0);
+                if (!_javljeno)
+                {
+                    _javljeno = true;
+                    LuxClip.OznaciProcitano(_indeks);
+                }
+                return;
+            }
+        }
+
+        public void Write(byte[] pv, int cb, IntPtr pcbWritten)
+        {
+            if (pcbWritten != IntPtr.Zero) Marshal.WriteInt32(pcbWritten, 0);
+        }
+
+        public void Seek(long dlibMove, int dwOrigin, IntPtr plibNewPosition)
+        {
+            long np = _fs.Seek(dlibMove, (SeekOrigin)dwOrigin);
+            if (plibNewPosition != IntPtr.Zero) Marshal.WriteInt64(plibNewPosition, np);
+        }
+
+        public void SetSize(long libNewSize) { _fs.SetLength(libNewSize); }
+
+        public void CopyTo(IStream pstm, long cb, IntPtr pcbRead, IntPtr pcbWritten)
+        {
+            if (pcbRead != IntPtr.Zero) Marshal.WriteInt32(pcbRead, 0);
+            if (pcbWritten != IntPtr.Zero) Marshal.WriteInt32(pcbWritten, 0);
+        }
+
+        public void Commit(int grfCommitFlags) { }
+        public void Revert() { }
+        public void LockRegion(long libOffset, long cb, int dwLockType) { }
+        public void UnlockRegion(long libOffset, long cb, int dwLockType) { }
+
+        public void Stat(out STATSTG pstatstg, int grfStatFlag)
+        {
+            pstatstg = new STATSTG();
+            pstatstg.type = 2;                       // STGTY_STREAM
+            pstatstg.cbSize = _fs.Length;
+        }
+
+        public void Clone(out IStream ppstm) { ppstm = null; }
+    }
+
+    // ================================================== IEnumFORMATETC rucno
+    [ComVisible(true)]
+    [ClassInterface(ClassInterfaceType.None)]
+    public class LuxEnum : IEnumFormatEtcRaw
+    {
+        private FORMATETC[] _a;
+        private int _i;
+
+        public LuxEnum(FORMATETC[] a) { _a = a; _i = 0; }
+
+        public int Next(int celt, FORMATETC[] rgelt, IntPtr pceltFetched)
+        {
+            int n = 0;
+            while (n < celt && _i < _a.Length)
+            {
+                rgelt[n] = _a[_i];
+                n++; _i++;
+            }
+            if (pceltFetched != IntPtr.Zero) Marshal.WriteInt32(pceltFetched, n);
+            return (n == celt) ? Hr.S_OK : Hr.S_FALSE;
+        }
+
+        public int Skip(int celt) { _i += celt; return (_i < _a.Length) ? Hr.S_OK : Hr.S_FALSE; }
+        public int Reset()        { _i = 0; return Hr.S_OK; }
+        public int Clone(out IEnumFormatEtcRaw ppenum) { ppenum = new LuxEnum(_a); return Hr.S_OK; }
+    }
+
+    // ========================================================== IDataObject
+    [ComVisible(true)]
+    [ClassInterface(ClassInterfaceType.None)]
+    public class LuxDataObject : IDataObjectRaw
+    {
+        private Stavka[] _s;
+        private FORMATETC[] _svi;
+
+        public LuxDataObject(Stavka[] s)
+        {
+            _s = s;
+            For.Registriraj();
+            List<FORMATETC> l = new List<FORMATETC>();
+
+            l.Add(Napravi(For._fgdw, -1, For.TYMED_HGLOBAL));
+            for (int i = 0; i < _s.Length; i++)
+                l.Add(Napravi(For._fc, i, For.TYMED_ISTREAM | For.TYMED_HGLOBAL));
+            l.Add(Napravi(For._pdde, -1, For.TYMED_HGLOBAL));
+            _svi = l.ToArray();
+        }
+
+        private static FORMATETC Napravi(short fmt, int lindex, int tymed)
+        {
+            FORMATETC f = new FORMATETC();
+            f.cfFormat = fmt;
+            f.ptd      = IntPtr.Zero;
+            f.dwAspect = For.DVASPECT_CONTENT;
+            f.lindex   = lindex;
+            f.tymed    = tymed;
+            return f;
+        }
+
+        // ---------------------------------------------------------- HGLOBAL
+        private static IntPtr UGlobal(byte[] podaci)
+        {
+            IntPtr h = Win.GlobalAlloc(Win.GMEM_MOVEABLE, new UIntPtr((uint)podaci.Length));
+            if (h == IntPtr.Zero) return IntPtr.Zero;
+            IntPtr p = Win.GlobalLock(h);
+            if (p == IntPtr.Zero) { Win.GlobalFree(h); return IntPtr.Zero; }
+            Marshal.Copy(podaci, 0, p, podaci.Length);
+            Win.GlobalUnlock(h);
+            return h;
+        }
+
+        // FILEGROUPDESCRIPTORW = UINT cItems + cItems x FILEDESCRIPTORW(592).
+        // Pise se rucno, bajt po bajt, jer se na strukturu oslanja Explorer:
+        // svaki pomak mora biti tocno tamo gdje Windows ocekuje.
+        internal byte[] Opisnik()
+        {
+            int vel = 4 + _s.Length * For.FD_SIZE;
+            byte[] b = new byte[vel];
+            BitConverter.GetBytes((uint)_s.Length).CopyTo(b, 0);
+
+            for (int i = 0; i < _s.Length; i++)
+            {
+                int o = 4 + i * For.FD_SIZE;
+                Stavka st = _s[i];
+
+                uint flagovi = For.FD_ATTRIBUTES | For.FD_WRITESTIME
+                             | For.FD_FILESIZE | For.FD_UNICODE;
+                BitConverter.GetBytes(flagovi).CopyTo(b, o + 0);
+                // clsid (16), sizel (8), pointl (8) ostaju nula - i tako treba:
+                // dimenzije i CLSID smisla imaju samo za OLE objekte.
+                BitConverter.GetBytes(For.FILE_ATTRIBUTE_NORMAL).CopyTo(b, o + 36);
+                // ftCreationTime (o+40) i ftLastAccessTime (o+48) ostaju nula,
+                // jer FD_CREATETIME / FD_ACCESSTIME nisu postavljeni.
+                long ft = DateTime.UtcNow.ToFileTimeUtc();
+                BitConverter.GetBytes(ft).CopyTo(b, o + 56);              // ftLastWriteTime
+                BitConverter.GetBytes((uint)(st.Vel >> 32)).CopyTo(b, o + 64);
+                BitConverter.GetBytes((uint)(st.Vel & 0xFFFFFFFFL)).CopyTo(b, o + 68);
+
+                // cFileName: 260 WCHAR, UTF-16LE, sa zavrsnom nulom. Rel moze
+                // nositi podmapu ("mapa/sub/x.txt") - Explorer je tada stvara.
+                string ime = st.Rel;
+                if (ime.Length > 259) ime = ime.Substring(0, 259);
+                byte[] nb = Encoding.Unicode.GetBytes(ime);
+                Array.Copy(nb, 0, b, o + For.FD_NAME_OFFSET, Math.Min(nb.Length, 518));
+            }
+            return b;
+        }
+
+        internal byte[] OpisnikZaTestni() { return Opisnik(); }
+
+        private static byte[] Effekt(uint v) { return BitConverter.GetBytes(v); }
+
+        // ---------------------------------------------------------- medium
+        private static bool Ima(int tymed, int koji) { return (tymed & koji) != 0; }
+
+        public int QueryGetData(ref FORMATETC f)
+        {
+            if (f.dwAspect != For.DVASPECT_CONTENT) return Hr.DV_E_FORMATETC;
+
+            if (f.cfFormat == For._fgdw)
+            {
+                if (f.lindex != -1) return Hr.DV_E_LINDEX;
+                return Ima(f.tymed, For.TYMED_HGLOBAL) ? Hr.S_OK : Hr.DV_E_TYMED;
+            }
+            if (f.cfFormat == For._fc)
+            {
+                if (f.lindex < 0 || f.lindex >= _s.Length) return Hr.DV_E_LINDEX;
+                if (Ima(f.tymed, For.TYMED_ISTREAM) || Ima(f.tymed, For.TYMED_HGLOBAL))
+                    return Hr.S_OK;
+                return Hr.DV_E_TYMED;
+            }
+            if (f.cfFormat == For._pdde || f.cfFormat == For._pdd)
+            {
+                return Ima(f.tymed, For.TYMED_HGLOBAL) ? Hr.S_OK : Hr.DV_E_TYMED;
+            }
+            // Nepoznato se odbija, a ne prihvaca pa presuti: prihvacanje bez
+            // podataka daje cilju praznu datoteku i to bez ijedne greske.
+            return Hr.DV_E_FORMATETC;
+        }
+
+        public int GetData(ref FORMATETC f, out STGMEDIUM m)
+        {
+            m = new STGMEDIUM();
+            m.pUnkForRelease = IntPtr.Zero;
+
+            int provjera = QueryGetData(ref f);
+            if (provjera != Hr.S_OK) return provjera;
+
+            if (f.cfFormat == For._fgdw)
+            {
+                m.tymed = For.TYMED_HGLOBAL;
+                m.unionmember = UGlobal(Opisnik());
+                if (m.unionmember == IntPtr.Zero) return Hr.E_OUTOFMEMORY;
+                return Hr.S_OK;
+            }
+            if (f.cfFormat == For._fc)
+            {
+                Stavka st = _s[f.lindex];
+                // HGLOBAL se nudi samo ako ga cilj izricito trazi: to znaci da
+                // nema nade da ce citati struju, pa se cijela datoteka ucitava
+                // u memoriju. IStream je inace uvijek prvi izbor.
+                if (!Ima(f.tymed, For.TYMED_ISTREAM) && Ima(f.tymed, For.TYMED_HGLOBAL))
+                {
+                    byte[] sadrzaj = File.ReadAllBytes(st.Put);
+                    m.tymed = For.TYMED_HGLOBAL;
+                    m.unionmember = UGlobal(sadrzaj);
+                    if (m.unionmember == IntPtr.Zero) return Hr.E_OUTOFMEMORY;
+                    return Hr.S_OK;
+                }
+                LuxStream ls = new LuxStream(st.Put, f.lindex, st.Vel);
+                m.tymed = For.TYMED_ISTREAM;
+                m.unionmember = Marshal.GetComInterfaceForObject(ls, typeof(IStream));
+                return Hr.S_OK;
+            }
+            if (f.cfFormat == For._pdde || f.cfFormat == For._pdd)
+            {
+                m.tymed = For.TYMED_HGLOBAL;
+                m.unionmember = UGlobal(Effekt(1));      // 1 = DROPEFFECT_COPY
+                if (m.unionmember == IntPtr.Zero) return Hr.E_OUTOFMEMORY;
+                return Hr.S_OK;
+            }
+            return Hr.DV_E_FORMATETC;
+        }
+
+        public int GetDataHere(ref FORMATETC f, ref STGMEDIUM m) { return Hr.E_NOTIMPL; }
+
+        public int GetCanonicalFormatEtc(ref FORMATETC fIn, out FORMATETC fOut)
+        {
+            fOut = fIn;
+            fOut.ptd = IntPtr.Zero;
+            return Hr.S_FALSE;      // S_FALSE = "nije bilo preusmjeravanja"
+        }
+
+        public int SetData(ref FORMATETC f, ref STGMEDIUM m, bool fRelease)
+        {
+            // Cilj ovdje javlja da je lijepljenje uspjelo - ali to rade samo
+            // OLE drag/drop sudionici, ne i Explorer pri Ctrl+V. Ovo je zato
+            // samo dodatni signal; glavni je kad struja stigne do kraja.
+            if (f.cfFormat == For._psuc) LuxClip.OznaciLijepljenje();
+            if (fRelease) RelMedium(ref m);
+            return Hr.S_OK;
+        }
+
+        internal static void RelMedium(ref STGMEDIUM m)
+        {
+            if (m.unionmember == IntPtr.Zero) return;
+            try
+            {
+                if (m.tymed == For.TYMED_HGLOBAL) Win.GlobalFree(m.unionmember);
+                else if (m.tymed == For.TYMED_ISTREAM) Marshal.Release(m.unionmember);
+            }
+            catch { }
+            m.unionmember = IntPtr.Zero;
+        }
+
+        public int EnumFormatEtc(int dwDirection, out IEnumFormatEtcRaw ppenum)
+        {
+            if (dwDirection != For.DATADIR_GET) { ppenum = null; return Hr.E_NOTIMPL; }
+            ppenum = new LuxEnum(_svi);
+            return Hr.S_OK;
+        }
+
+        public int DAdvise(ref FORMATETC f, int advf, IntPtr sink, out int conn)
+        {
+            conn = 0;
+            return Hr.OLE_E_ADVISENOTSUPPORTED;
+        }
+        public int DUnadvise(int conn) { return Hr.OLE_E_ADVISENOTSUPPORTED; }
+        public int EnumDAdvise(out IntPtr ppenum) { ppenum = IntPtr.Zero; return Hr.OLE_E_ADVISENOTSUPPORTED; }
+    }
+
+    // ============================================================== LuxClip
+    // PS strana ne dira OLE izravno: sve ide kroz ovu klasu, koja drzi
+    // vlastitu STA nit i na njoj vrti pravi message pump. Bez message pumpa
+    // proxy s druge strane ne dobije odgovor - a to je upravo tihi neuspjeh
+    // koji se ne vidi kao greska, samo kao "Ctrl+V ne radi".
+    public static class LuxClip
+    {
+        private static readonly object _lok = new object();
+        private static Thread _nit;
+        private static volatile bool _kraj = true;
+        private static volatile bool _postavljeno;
+        private static volatile string _greska;
+        private static Stavka[] _stavke;
+        private static int[] _oznaka;
+        private static int[] _gotovo;
+        private static int _broj;
+        private static int _procitano;
+        private static volatile bool _lijepljeno;
+        private static volatile bool _isteklo;
+
+        // opis: jedan redak po datoteci, polja odvojena TAB-om: put, rel, velicina
+        public static string Postavi(string opis, int timeoutSec)
+        {
+            Ocisti();
+            Stavka[] ss = Parsaj(opis);
+            if (ss == null || ss.Length == 0) return "nema stavki";
+
+            lock (_lok)
+            {
+                _stavke = ss;
+                _oznaka = new int[ss.Length];
+                _gotovo = new int[ss.Length];
+                _broj = ss.Length;
+                _procitano = 0;
+                _lijepljeno = false;
+                _isteklo = false;
+                _greska = null;
+                _postavljeno = false;
+                _kraj = false;
+
+                _nit = new Thread(Nit);
+                _nit.SetApartmentState(ApartmentState.STA);
+                _nit.IsBackground = true;
+                _nit.Name = "LuxClip";
+                _nit.Start(timeoutSec);
+            }
+
+            // Cekanje na potvrdu da je meduspremnik stvarno postavljen. Bez
+            // ovoga bi PS odmah javio "spremno", a korisnikov Ctrl+V bi dosao
+            // na jos prazan meduspremnik.
+            int cek = 0;
+            while (cek < 500 && !_postavljeno && !_isteklo && _greska == null)
+            {
+                Thread.Sleep(10); cek++;
+            }
+            if (_greska != null) return _greska;
+            if (!_postavljeno) return "meduspremnik nije postavljen u roku";
+            return "";
+        }
+
+        private static Stavka[] Parsaj(string opis)
+        {
+            if (string.IsNullOrEmpty(opis)) return null;
+            List<Stavka> l = new List<Stavka>();
+            string[] redci = opis.Split('\n');
+            foreach (string r in redci)
+            {
+                if (r.Length == 0) continue;
+                string[] p = r.Split('\t');
+                if (p.Length < 3) continue;
+                Stavka s = new Stavka();
+                s.Put = p[0];
+                s.Rel = p[1];
+                long v;
+                if (!long.TryParse(p[2], out v)) v = 0;
+                s.Vel = v;
+                l.Add(s);
+            }
+            return l.ToArray();
+        }
+
+        private static void Nit(object stanje)
+        {
+            int timeoutSec = (int)stanje;
+            IntPtr pdo = IntPtr.Zero;
+            try
+            {
+                int hr = Win.OleInitialize(IntPtr.Zero);
+                if (hr != Hr.S_OK && hr != Hr.S_FALSE)
+                {
+                    _greska = "OleInitialize: 0x" + hr.ToString("X8");
+                    _isteklo = true;
+                    return;
+                }
+
+                LuxDataObject doo = new LuxDataObject(_stavke);
+                pdo = Marshal.GetComInterfaceForObject(doo, typeof(IDataObjectRaw));
+                hr = Win.OleSetClipboard(pdo);
+                if (hr != Hr.S_OK)
+                {
+                    _greska = "OleSetClipboard: 0x" + hr.ToString("X8");
+                    _isteklo = true;
+                    return;
+                }
+                _postavljeno = true;
+
+                DateTime krajnji = DateTime.UtcNow.AddSeconds(timeoutSec);
+                MSG m;
+                while (!_kraj)
+                {
+                    // PeekMessage + kratki predah, a ne GetMessage: GetMessage
+                    // blokira, pa se ni timeout ni Ocisti() ne bi primijetili.
+                    while (Win.PeekMessageW(out m, IntPtr.Zero, 0, 0, Win.PM_REMOVE))
+                    {
+                        Win.TranslateMessage(ref m);
+                        Win.DispatchMessageW(ref m);
+                    }
+                    if (DateTime.UtcNow > krajnji) { _isteklo = true; break; }
+                    Thread.Sleep(15);
+                }
+
+                // OleSetClipboard(NULL) prazni OLE meduspremnik. Ne smije se
+                // zvati OleFlushClipboard: on bi u meduspremnik prepisao samo
+                // HGLOBAL formate, a struja (FileContents) bi se izgubila.
+                Win.OleSetClipboard(IntPtr.Zero);
+            }
+            catch (Exception ex)
+            {
+                _greska = ex.GetType().Name + ": " + ex.Message;
+            }
+            finally
+            {
+                if (pdo != IntPtr.Zero) { try { Marshal.Release(pdo); } catch { } }
+                try { Win.OleUninitialize(); } catch { }
+                _postavljeno = false;
+            }
+        }
+
+        internal static void OznaciProcitano(int i)
+        {
+            if (_oznaka == null || i < 0 || i >= _oznaka.Length) return;
+            if (Interlocked.Exchange(ref _oznaka[i], 1) == 0)
+                Interlocked.Increment(ref _procitano);
+        }
+
+        // Javlja da je prijenos te datoteke gotov - od tog trenutka LuxStream
+        // vise ne ceka na rast datoteke, nego na pitanje "ima li jos" odgovara
+        // "nema". Bez ovoga bi svaka datoteka cija je stvarna velicina manja od
+        // najavljene cekala do tvrdog roka.
+        public static void OznaciGotovo(int i)
+        {
+            if (_gotovo == null || i < 0 || i >= _gotovo.Length) return;
+            Interlocked.Exchange(ref _gotovo[i], 1);
+        }
+
+        // Javlja da je prijenos te datoteke gotov - od tog trenutka LuxStream
+        // vise ne ceka na rast datoteke, nego na pitanje "ima li jos" odgovara
+        // "nema". Bez ovoga bi svaka datoteka cija je stvarna velicina manja od
+        // najavljene cekala do tvrdog roka.
+        internal static bool JeGotov(int i)
+        {
+            if (_gotovo == null || i < 0 || i >= _gotovo.Length) return true;
+            return Interlocked.CompareExchange(ref _gotovo[i], 0, 0) != 0;
+        }
+
+        internal static bool JeKraj() { return _kraj; }
+
+        internal static void OznaciLijepljenje() { _lijepljeno = true; }
+
+        // 0 = nista ne visi, 1 = postavljeno (nitko nije citao),
+        // 2 = cita se, 3 = sve procitano, 4 = greska
+        public static int Stanje()
+        {
+            if (_greska != null) return 4;
+            if (_isteklo || !_postavljeno) return 0;
+            if (_broj > 0 && _procitano >= _broj) return 3;
+            if (_procitano > 0) return 2;
+            return 1;
+        }
+
+        public static int Procitano()   { return _procitano; }
+        public static int Broj()        { return _broj; }
+        public static bool Lijepljeno() { return _lijepljeno; }
+        public static string Greska()   { return _greska; }
+
+        public static void Ocisti()
+        {
+            _kraj = true;
+            Thread t = _nit;
+            if (t != null && t.IsAlive) { try { t.Join(3000); } catch { } }
+            _nit = null;
+            _postavljeno = false;
+        }
+
+        // --- dijagnostika za -SelfTest: opisnik se gradi bez meduspremnika ---
+        public static byte[] OpisnikZaTest(string opis)
+        {
+            Stavka[] ss = Parsaj(opis);
+            if (ss == null) return new byte[0];
+            LuxDataObject d = new LuxDataObject(ss);
+            return d.OpisnikZaTestni();
+        }
+
+        public static int FormatEtaBrojZaTest()
+        {
+            Stavka[] ss = Parsaj("a\tx.txt\t1\n");
+            if (ss == null) return 0;
+            LuxDataObject d = new LuxDataObject(ss);
+            IEnumFormatEtcRaw e;
+            if (d.EnumFormatEtc(For.DATADIR_GET, out e) != Hr.S_OK) return 0;
+            FORMATETC[] a = new FORMATETC[8];
+            IntPtr n = Marshal.AllocHGlobal(4);
+            int c = 0;
+            try { e.Next(8, a, n); c = Marshal.ReadInt32(n); }
+            finally { Marshal.FreeHGlobal(n); }
+            return c;
+        }
+
+        // Citа jedan HGLOBAL iz GetData i vraca ga kao bajtove - time se u
+        // samotestu provjerava da opisnik stvarno izlazi onakav kakav treba.
+        public static byte[] MedijZaTest(string opis, int lindex)
+        {
+            Stavka[] ss = Parsaj(opis);
+            if (ss == null) return new byte[0];
+            LuxDataObject d = new LuxDataObject(ss);
+            FORMATETC f = new FORMATETC();
+            f.cfFormat = (lindex < 0) ? For._fgdw : For._fc;
+            f.ptd = IntPtr.Zero;
+            f.dwAspect = For.DVASPECT_CONTENT;
+            f.lindex = (lindex < 0) ? -1 : lindex;
+            f.tymed = For.TYMED_HGLOBAL;
+
+            STGMEDIUM m;
+            if (d.GetData(ref f, out m) != Hr.S_OK) return new byte[0];
+            byte[] r;
+            try
+            {
+                long cb;
+                if (lindex < 0)
+                {
+                    cb = 4 + ss.Length * For.FD_SIZE;
+                }
+                else
+                {
+                    cb = ss[lindex].Vel;
+                }
+                r = new byte[cb];
+                IntPtr p = Win.GlobalLock(m.unionmember);
+                try { if (p != IntPtr.Zero) Marshal.Copy(p, r, 0, (int)cb); }
+                finally { if (p != IntPtr.Zero) Win.GlobalUnlock(m.unionmember); }
+            }
+            finally { LuxDataObject.RelMedium(ref m); }
+            return r;
+        }
+    }
+}
+'@ -Language CSharp -ErrorAction Stop
+    $script:LuxTip = $true
+    return $true
+  } catch {
+    $script:LuxGreska = $_.Exception.Message
+    Log ('  [!] LuxShim se ne moze sastaviti: ' + $script:LuxGreska)
+    return $false
+  }
+}
 
 function Init-Sta {
   if ($script:StaRs) { return }
@@ -443,57 +1325,15 @@ $img = [System.Drawing.Image]::FromStream($ms)
   } catch { Log "  [!] ne mogu postaviti sliku u meduspremnik: $($_.Exception.Message)"; return $false }
 }
 
-function Postavi-Datoteke([string[]]$putanje) {
-  if (-not $putanje -or $putanje.Count -eq 0) { return $false }
-  try {
-    $null = Invoke-Sta @'
-$k = New-Object System.Collections.Specialized.StringCollection
-foreach ($p in $P) { [void]$k.Add($p) }
-$do = New-Object System.Windows.Forms.DataObject
-$do.SetFileDropList($k)
-# Explorer uz popis datoteka uvijek salje i "Preferred DropEffect". Bez njega
-# ostaje samo jednostruki CF_HDROP, pa se Ctrl+V u Exploreru zna odbiti ili
-# zalijepiti kao tekst putanje umjesto kao datoteke.
+# Primljene datoteke se od 01.11.2026. NE stavljaju u meduspremnik preko
+# CF_HDROP (SetFileDropList). Ukinuto je jer je nosilo putanju, pa je Explorer
+# pri Ctrl+V sam odlucivao ime i odrediste i, kod lijepljenja na drugi disk,
+# kopirao datoteku dok je ova jos prazna. Umjesto toga se postavlja OPISNIK
+# cijele grupe (vidi Postavi-Opisnik i LuxShim) - imena i velicine dolaze od
+# nas, a sadrzaj iz nase struje, pa Explorer nad nasom datotekom ne radi nista.
 #
-# NAJVAZNIJE: efekt se MORA predati kao MemoryStream, a NE kao goli byte[].
-# Kad se SetData preda byte[], .NET ga SERIALIZIRA i u meduspremnik odlozi
-# serializacijsko zaglavlje ISPRED podataka. Microsoft to izricito napominje u
-# dokumentaciji klase Clipboard: "If your target application requires a very
-# specific data format, the headers added to the data in the serialization
-# process may prevent the application from recognizing your data. To preserve
-# your data format, add your data as a Byte array to a MemoryStream and pass the
-# MemoryStream to the SetData method."
-#
-# Posljedica golog byte[] je podmukla: Explorer na odredistu procita prvih 4
-# bajta zaglavlja (0x00 0x00 0x00 0x00) kao DWORD, dobije DROPEFFECT_NONE = 0 i
-# NE URADI NISTO - bez greske i bez poruke. Ctrl+V na radnoj povrsini samo ne
-# napravi nista, a datoteka ostane u Primljenom. Vidjeno 31.10.2026. na VM-u:
-# prijenos je prosao, "u meduspremnik stavljeno 1 datoteka" je zapisano, a na
-# radnoj povrsini nije bilo nicega.
-#
-# Position se vraca na 0 jer citac moze citati od trenutne pozicije, a ne od
-# pocetka - nakon Write je pozicija na kraju streama.
-#
-# 2 = DROPEFFECT_MOVE, a NE 1 = DROPEFFECT_COPY. Primljeno je samo PRIVREMENO
-# odlagaliste: kad korisnik zalijepi datoteku na pravo mjesto (npr. na radnu
-# povrsinu), Explorer je tamo PREMJESTI i izbrise iz Primljenog. Time se
-# odlagaliste samo cisti i nista se ne drzi dvaput na disku - inace bi se za
-# svaki veliki ISO placalo duplo.
-#
-# Cijena, svjesno prihvacena: nakon uspjesnog lijepljenja datoteke vise nema u
-# meduspremniku, pa se isti meduspremnik NE moze zalijepiti dvaput. Zato se
-# Primljeno i ne prazni samo od sebe - datoteka ostaje tamo dok je korisnik ne
-# zalijepi (ili dok je rucno ne obrise).
-$ms = New-Object System.IO.MemoryStream
-$ms.Write([byte[]](2,0,0,0), 0, 4)
-$ms.Position = 0
-$do.SetData('Preferred DropEffect', $true, $ms)
-[System.Windows.Forms.Clipboard]::SetDataObject($do, $true)
-""
-'@ @{ P = $putanje }
-    return $true
-  } catch { Log "  [!] ne mogu postaviti datoteke u meduspremnik: $($_.Exception.Message)"; return $false }
-}
+# Ostaje samo citanje (Dohvati-Meduspremnik), jer ono sluzi za DRUGI smjer -
+# da se ono sto korisnik kopira ovdje posalje na drugu stranu.
 
 # Nakon sto se meduspremnik POSTAVI iz mreze, mora se zapamtiti sto u njemu
 # sada stoji - inace bi ga lokalna anketa vidjela kao "novo" i poslala natrag.
@@ -705,170 +1545,177 @@ function Odredi-Odrediste($zag) {
 }
 
 # ------------------------------------------------- cekanje na lijepljenje ----
-# Tri stvari koje ovaj odjeljak radi, i sve tri su posljedica jednog zahtjeva:
-# prijenos mora krenuti Ctrl+V-om, a ne Ctrl+C-om. Potpuno objasnjenje je u
-# zaglavlju skripte pod "PAUZA / NASTAVI".
+# Sto ovaj odjeljak radi: cijelu grupu primljenih datoteka predaje
+# meduspremniku kao OPISNIK (FileGroupDescriptorW) i ceka da ju cilj procita.
+# Potpuno objasnjenje je u zaglavlju skripte.
+#
+# Nema vise citanja putanje iz drzaca (GetFinalPathNameByHandle): Explorer
+# datoteku od sada ne premjesta i ne preimenuje - sadrzaj cita iz nase struje,
+# pa se u dnevniku vise ne moze (niti treba) pokazati kamo je otisla.
 
-# Kamo je datoteka otisla, procitano iz DRZACA a ne iz putanje.
-#
-# Kljucno: kad Explorer zalijepi datoteku s efektom premjestanja, on ju na
-# istom disku samo PREIMENUJE. Nas otvoreni drzac pokazuje na istu datoteku i
-# nakon preimenovanja, a ova funkcija iz njega procita TRENUTNU putanju - pa se
-# u dnevnik moze zapisati tocno mjesto gdje je korisnik zalijepio. To je i
-# dokaz da je mehanizam proradio, a ne samo da je putanja iz Primljenog
-# nestala.
-#
-# GetFinalPathNameByHandle vraca putanju s prefiksom \\?\ koji se ovdje skida.
-# Sve je u try/catch i NIJE obavezno: ako Citac tipova ne uspije (npr. nema
-# csc.exe), funkcija vrati prazno i provjera se i dalje radi preko Test-Path.
-function Putanja-Rukovanja($fs) {
-  if (-not $fs -or $script:LuxRukNema) { return '' }
-  try {
-    if (-not ('LuxRuk' -as [type])) {
-      Add-Type -TypeDefinition @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class LuxRuk {
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder p, uint c, uint f);
-    public static uint Putanja(SafeFileHandle h, StringBuilder p, int c) {
-        return GetFinalPathNameByHandleW(h, p, (uint)c, 0);
-    }
-}
-'@
-    }
-    $sb = New-Object System.Text.StringBuilder 1024
-    $n = [LuxRuk]::Putanja($fs.SafeFileHandle, $sb, $sb.Capacity)
-    if ($n -le 0 -or $n -gt $sb.Capacity) { return '' }
-    $p = $sb.ToString()
-    if ($p.StartsWith('\\?\UNC\')) { return ('\\' + $p.Substring(8)) }
-    if ($p.StartsWith('\\?\')) { $p = $p.Substring(4) }
-    return $p
-  } catch {
-    # Neuspjeh se pamti: bez toga bi se Citac tipova pokusavao sastaviti pri
-    # svakom lijepljenju, a to je sekunda ili dvije svaki put. Putanja je samo
-    # ukras u dnevniku - provjera lijepljenja radi i bez nje.
-    $script:LuxRukNema = $true
-    return ''
-  }
-}
 
-# Otvara odrediste i - ako se na ovu datoteku ceka - odmah stavlja meduspremnik
-# i salje PAUZU.
+
+# Otvara odrediste primljene datoteke. Nista se ne najavljuje unaprijed i
+# nista se ne napuhava: datoteka se samo pise, svojom stvarnom velicinom.
+# Meduspremnik se postavlja tek kad su poznata SVA zaglavlja grupe - vidi
+# Postavi-Opisnik.
 #
-# Zasto se drzac otvara drugacije kad se ceka: obicno otvaranje (FileShare.None)
-# ZAKLJUCALO bi datoteku, pa ju Explorer ne bi mogao ni preimenovati ni
-# zalijepiti. Uz ReadWrite+Delete Explorer ju premjesti, a pisanje kroz nas
-# drzac ide dalje u istu datoteku.
-function Novi-Prijem([string]$odred, $zag, $stream) {
+# Drzac se otvara s ReadWrite, a BEZ Delete: Explorer datoteku od sada ne
+# premjesta (efekt je COPY), pa nema koga pustiti da ju obrise - a otvoren
+# drzac bez Delete je ono sto nas sprecava da ju sami obrisemo na kraju.
+function Novi-Prijem([string]$odred, $zag) {
   $velicina = [int64]$zag.size
-  $cekaj = $false
-
-  # Grupa s vise datoteka se NE ceka: meduspremnik se za grupu postavlja tek
-  # kad su sve stigle (sve putanje odjednom), pa se prije toga nema sto
-  # zalijepiti - a meduspremnik se ne smije mijenjati u pola grupe, jer bi
-  # korisnik zalijepio samo jednu od njih. Kod grupe s JEDNOM datotekom je
-  # najava vec rekla sve sto treba.
-  if (-not $NoLazy -and $velicina -ge ($LazyMinMB * 1MB)) {
-    if ($script:Grupa -and $script:Grupa.Preostalo -eq 1) { $cekaj = $true }
+  $fs = [System.IO.File]::Open($odred, 'Create', 'Write', 'ReadWrite')
+  @{
+    Fs        = $fs
+    Putanja   = $odred
+    Got       = 0
+    Ocekivano = $velicina
+    Indeks    = -1          # popunjava pozivatelj (0x20), vidi Sync-Loop
   }
-
-  if ($cekaj) {
-    $fs = New-Object System.IO.FileStream -ArgumentList @(
-      $odred,
-      [System.IO.FileMode]::Create,
-      [System.IO.FileAccess]::Write,
-      ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
-    # Datoteka odmah dobiva punu velicinu iz najave. Bez toga Explorer ne bi
-    # imao sto zalijepiti - a s njom je na odredistu odmah datoteka tocne
-    # velicine, koju nas drzac zatim puni.
-    try { $fs.SetLength($velicina) } catch { Log ("  [!] ne mogu postaviti velicinu: " + $_.Exception.Message) }
-  } else {
-    $fs = [System.IO.File]::Open($odred, 'Create', 'Write')
-  }
-
-  $rx = @{
-    Fs = $fs; Putanja = $odred; Got = 0; Ocekivano = $velicina
-    Grupa = $script:Grupa
-    ClipGrupa = ($null -ne $script:Grupa)
-    Lijepi = $cekaj
-    Ceka = $false
-    CekanjeOd = [datetime]::MinValue
-  }
-
-  if ($cekaj) {
-    if (Postavi-Datoteke @($odred)) {
-      # Hash se racuna iz onoga sto je poslano, pa lokalna anketa ovo ne vidi
-      # kao nov sadrzaj i ne posalje natrag - vidi Zapamti-Poznati.
-      Zapamti-Poznati @{ Vrsta = 'files'; Datoteke = @($odred) }
-      $rx.Ceka = $true
-      $rx.CekanjeOd = Get-Date
-      Send-Frame $stream 0x30 (Utf8 (Json-Ukratko @{ name = (Split-Path $odred -Leaf); size = $velicina }))
-      Log ("  <- meduspremnik spreman PRIJE prijenosa: {0} ({1} MB) - Ctrl+V sad radi, cekam" -f `
-             (Split-Path $odred -Leaf), [math]::Round($velicina / 1MB, 1))
-    } else {
-      # Meduspremnik nije postavljen - nema smisla ni cekati ni zaustavljati
-      # posiljatelja. Prijenos ide dalje, starim nacinom.
-      $rx.Lijepi = $false
-      Log ("  [!] meduspremnik nije postavljen - primam {0} bez cekanja" -f (Split-Path $odred -Leaf))
-    }
-  }
-
-  $rx
 }
 
-# Je li korisnik zalijepio? Provjera ide po okretaju petlje (PollMs).
+# Postavlja meduspremnik za cijelu grupu - jednim potezom, iz opisnika.
 #
-# Signal je nestanak same putanje: Explorer je s efektom premjestanja datoteku
-# PREMJESTIO iz Primljenog, pa je tamo vise nema. Nas drzac je prati (zato
-# FileShare.Delete u Novi-Prijem), a pisanje kroz njega ide u premjestenu
-# datoteku.
-#
-# Ako nitko ne zalijepi u roku, salje se NASTAVI i prijenos se dovrsi u
-# Primljeno\ - tocno staro ponasanje. Nista se ne gubi ni u jednom slucaju.
-function Provjeri-Lijepljenje($rx, $stream) {
-  if (-not $rx -or -not $rx.Ceka) { return }
+# Zove se tek kad su poznata SVA zaglavlja grupe: opisnik mora nositi ime i
+# velicinu svake datoteke, pa se prije toga ne moze sastaviti. Host zaglavlja
+# salje prva, jedno za drugim, pa je taj trenutak rano - ne ceka se ni jedan
+# bajt sadrzaja (vidi zaglavlje skripte).
+function Postavi-Opisnik($grupa) {
+  if ($NoLazy -or -not $script:LuxTip) { return }
+  if (-not $grupa) { return }
+  if ($grupa.Ocekivano -le 0) { return }
+  if ($grupa.Zaglavlja -lt $grupa.Ocekivano) { return }
+  if ($grupa.Opisnik) { return }
 
-  $sada = Get-Date
-  $cekalo = [int]($sada - $rx.CekanjeOd).TotalSeconds
+  $uk = 0
+  foreach ($e in $grupa.Stavke) { $uk += [int64]$e.Vel }
+  if ($LazyMinMB -gt 0 -and $uk -lt ($LazyMinMB * 1MB)) { return }
 
-  if (Test-Path -LiteralPath $rx.Putanja) {
-    if ($cekalo -le $LazyCekajSec) { return }
-    $rx.Ceka = $false
-    Send-Frame $stream 0x31 @()
-    Log ("  [!] nitko nije zalijepio {0} s - nastavljam i pisem dalje u Primljeno\" -f $cekalo)
+  $redci = @()
+  foreach ($e in $grupa.Stavke) {
+    $rel = ($e.Rel -replace '\\', '/')
+    if ([string]::IsNullOrWhiteSpace($rel)) { $rel = (Split-Path $e.Put -Leaf) }
+    $redci += ($e.Put + "`t" + $rel + "`t" + [int64]$e.Vel)
+  }
+  $opis = ($redci -join "`n")
+
+  $greska = ''
+  try { $greska = [LuxShim.LuxClip]::Postavi($opis, $LazyCekajSec) }
+  catch { $greska = $_.Exception.Message }
+
+  if ($greska) {
+    Log ("  [!] opisnik nije postavljen: " + $greska)
+    $script:Grupa = $null
     return
   }
-  $rx.Ceka = $false
-  Send-Frame $stream 0x31 @()
-  $kamo = Putanja-Rukovanja $rx.Fs
-  if ($kamo) {
-    Log ("  <- zalijepljeno nakon {0} s - nastavljam punom brzinom  ->  {1}" -f $cekalo, $kamo)
-  } else {
-    # Putanja se iz drzaca ne moze procitati. Najcesce to znaci da je datoteka
-    # OBRISANA, a ne preimenovana - a to se dogodi kod lijepljenja na DRUGI
-    # disk: Explorer s efektom premjestanja tada kopira datoteku i izbrise
-    # izvor. Kopija nastaje u trenutku lijepljenja, dakle dok je nasa datoteka
-    # jos puna nula, a prijenos dalje ide u drzac koji pokazuje na obrisanu
-    # datoteku. Kopija na odredistu ostaje neispravna i to se ovime ne moze
-    # popraviti - moze se samo zapisati da se uzrok vidi u dnevniku.
-    $poruka = "  [!] zalijepljeno nakon {0} s, ali putanja iz drzaca nije citljiva - " +
-              "datoteka je vjerojatno OBRISANA (lijepljenje na DRUGI disk). " +
-              "Kopija na odredistu moze ostati prazna - lijepi unutar ISTOG diska."
-    Log ($poruka -f $cekalo)
+
+  $grupa.Opisnik = $true
+  $grupa.OpisnikOd = Get-Date
+  $grupa.SmirenjeOd = $null
+  Log ("  <- meduspremnik spreman: {0} datoteka ({1} MB) - Ctrl+V ih lijepi sve odjednom" -f `
+         $grupa.Stavke.Count, [math]::Round($uk / 1MB, 1))
+}
+
+# Je li grupa zalijepljena, i je li vrijeme da se kanal zatvori i pocisti?
+#
+# Signal nije vise "putanja je nestala" - Explorer datoteku NE dira, efekt je
+# COPY. Gleda se nasa strana kanala: LuxStream javi kad cilj procita zadnji
+# bajt svake datoteke, pa Stanje() prijede u 3. Tek tada - i to nakon kratkog
+# predaha, da cilj stigne zapisati u odrediste - kanal se zatvara i
+# Primljeno\ cisti.
+function Provjeri-Opisnik($grupa) {
+  if (-not $grupa -or -not $grupa.Opisnik -or -not $script:LuxTip) { return }
+
+  $sada = Get-Date
+  $stanje = 0
+  $lijepljeno = $false
+  try {
+    $stanje = [LuxShim.LuxClip]::Stanje()
+    $lijepljeno = [LuxShim.LuxClip]::Lijepljeno()
+  } catch { }
+
+  if ($stanje -eq 3 -or $lijepljeno) {
+    if (-not $grupa.SmirenjeOd) { $grupa.SmirenjeOd = $sada }
+    if (($sada - $grupa.SmirenjeOd).TotalSeconds -lt 3) { return }
+    $sek = [int]($sada - $grupa.OpisnikOd).TotalSeconds
+    Log ("  <- zalijepljeno nakon {0} s ({1} datoteka) - kanal zatvoren" -f $sek, $grupa.Stavke.Count)
+    Zatvori-Opisnik $grupa
+    return
+  }
+
+  # Kanal je zatvoren izvana: istekao je rok u LuxClip-u, sastavljanje je
+  # palo, ili je meduspremnik preuzeo netko drugi.
+  if ($stanje -eq 0 -or $stanje -eq 4) {
+    $g = ''
+    try { $g = [LuxShim.LuxClip]::Greska() } catch { }
+    $cekalo = [int]($sada - $grupa.OpisnikOd).TotalSeconds
+    if ($g) {
+      Log ("  [!] kanal: " + $g)
+    } else {
+      Log ("  [.] nitko nije zalijepio {0} s - opisnik povucen; datoteke ostaju u Primljeno\" -f $cekalo)
+    }
+    $grupa.Opisnik = $null
+    $script:Grupa = $null
   }
 }
 
-# Tekst i slika koji stignu DOK se ceka na lijepljenje.
+# Zatvara kanal i brise primljene datoteke ove grupe.
 #
-# Meduspremnik u tom trenutku drzi putanju datoteke koju korisnik upravo
-# lijepi. Postaviti tekst preko toga znaci pojesti upravo ono sto korisnik
-# lijepi. Zato se takav sadrzaj ne odbacuje nego ODGADA - primijeni se odmah
-# nakon sto prijenos krene. U praksi se ovo ne bi trebalo ni dogoditi: host
-# ne salje meduspremnik dok drzi pauzu (vidi pollClipboard u luxbridge.cpp).
-# Ovo je druga linija obrane, za stariji host koji PAUZU ignorira.
+# Brise se TEK nakon sto je cilj procitao zadnji bajt (vidi Provjeri-Opisnik),
+# pa datoteka nikome vise ne treba. MOVE se namjerno ne koristi: pri
+# lijepljenju na drugi disk Explorer bi ga izveo kao kopiraj-pa-obrisi i
+# kopirao bi datoteku u trenutku dok je jos prazna ili nedovrsena.
+function Zatvori-Opisnik($grupa) {
+  if ($script:LuxTip) { try { [LuxShim.LuxClip]::Ocisti() } catch { } }
+  Ocisti-Primljeno $grupa
+  $grupa.Opisnik = $null
+  $script:Grupa = $null
+  # Kratki muk nakon zatvaranja: bez njega bi anketa mogla procitati nas
+  # vlastiti meduspremnik u trenutku dok se jos rasklapao.
+  $script:PreskociDo = (Get-Date).AddSeconds(1.5)
+}
+
+# Brise primljene datoteke ove grupe iz Primljeno\, a zatim i mape koje je
+# Odredi-Odrediste usput napravio - od najdublje prema plici, i to samo one
+# koje su ostale prazne.
+function Ocisti-Primljeno($grupa) {
+  if (-not $grupa) { return }
+  $mape = New-Object 'System.Collections.Generic.HashSet[string]'
+  $obrisano = 0
+  foreach ($e in $grupa.Stavke) {
+    try {
+      if (Test-Path -LiteralPath $e.Put) {
+        Remove-Item -LiteralPath $e.Put -Force -ErrorAction Stop
+        $obrisano++
+      }
+      $d = Split-Path $e.Put -Parent
+      while ($d -and $d.Length -gt $prim.Length -and $d.StartsWith($prim)) {
+        [void]$mape.Add($d)
+        $d = Split-Path $d -Parent
+      }
+    } catch {
+      Log ("  [!] ne mogu obrisati {0}: {1}" -f (Split-Path $e.Put -Leaf), $_.Exception.Message)
+    }
+  }
+  $ured = @($mape) | Sort-Object Length -Descending
+  foreach ($d in $ured) {
+    try {
+      $ostalo = @(Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue)
+      if ($ostalo.Count -eq 0) { Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue }
+    } catch { }
+  }
+  if ($obrisano -gt 0) { Log ("  [.] pocisceno {0} datoteka iz Primljeno\" -f $obrisano) }
+}
+
+# Tekst i slika koji stignu DOK kanal za datoteke stoji.
+#
+# Meduspremnik u tom trenutku drzi opisnik grupe koju korisnik upravo lijepi.
+# Postaviti tekst preko toga znaci pojesti upravo ono sto korisnik lijepi.
+# Zato se takav sadrzaj ne odbacuje nego ODGADA - primijeni se odmah nakon sto
+# se kanal zatvori. U praksi se ovo ne bi trebalo ni dogoditi: host ne salje
+# meduspremnik dok kanal stoji (vidi pollClipboard u luxbridge.cpp). Ovo je
+# druga linija obrane, za stariji host koji to ne provjerava.
 function Odgodi-Meduspremnik([string]$vrsta, $sadrzaj) {
   $script:Odgoda = @{ Vrsta = $vrsta; Sadrzaj = $sadrzaj }
   Log ("  [.] {0} iz mreze odgodjen dok traje cekanje na lijepljenje" -f $vrsta)
@@ -958,45 +1805,28 @@ function Posalji-Grupu($stream, $grupa) {
 }
 
 # --------------------------------------------------------- primanje datoteke
-function Zavrsi-Primanje($rx, $stream) {
+#
+# Zatvara drzac i javlja kanalu da je ova datoteka gotova - od tog trenutka
+# LuxStream vise ne ceka na njezin rast, nego odmah daje kraj struje.
+#
+# Duljina se NE svodi na broj primljenih bajtova: datoteka nikad nije bila
+# napuhana na najavljenu velicinu (vidi Novi-Prijem), pa je na disku tocno
+# onolika koliko je bajtova stiglo. Ako je veza pukla prije kraja, datoteka
+# ostaje kratka - i to se u dnevniku izricito vidi.
+function Zavrsi-Primanje($rx) {
   if (-not $rx) { return }
-  $cekao = $rx.Ceka
-  $rx.Ceka = $false
-  # Datoteka koja je cekala na lijepljenje unaprijed je dobila PUNU velicinu iz
-  # najave (vidi Novi-Prijem). Ako je stiglo manje bajtova nego sto je najavljeno
-  # - veza je pukla - rep bi ostao same nule. Zato se duljina svodi na ono sto
-  # je stvarno primljeno. Kroz drzac, pa radi i ako je datoteka u meduvremenu
-  # premjestena na odrediste.
-  if ($rx.Lijepi -and $rx.Got -lt $rx.Ocekivano) {
-    try { $rx.Fs.SetLength([int64]$rx.Got) } catch { }
-  }
   try { if ($rx.Fs) { $rx.Fs.Dispose() } } catch { }
+  if ($script:LuxTip -and $rx.Indeks -ge 0) {
+    try { [LuxShim.LuxClip]::OznaciGotovo($rx.Indeks) } catch { }
+  }
   $script:Rx = $null
+
+  $kratko = ''
+  if ($rx.Got -lt $rx.Ocekivano) {
+    $kratko = ("  [!] primljeno {0} od {1} B - veza je pukla prije kraja" -f $rx.Got, $rx.Ocekivano)
+  }
   Log ("  <- datoteka {0}  ({1} B)" -f (Split-Path $rx.Putanja -Leaf), $rx.Got)
-
-  # Datoteka koja je cekala na lijepljenje: meduspremnik je postavljen JOS NA
-  # POCETKU prijenosa (vidi Novi-Prijem), pa se ovdje NE postavlja ponovno -
-  # korisnik je ili vec zalijepio ili ce zalijepiti, a novo postavljanje bi
-  # popis putanja vratilo na ono sto je ostalo u Primljenom.
-  #
-  # Do ovoga u praksi dolazi samo sa starijim hostom koji PAUZU ignorira i
-  # prijenos dovrsi prije nego je korisnik stigao zalijepiti.
-  if ($rx.Lijepi) {
-    if ($cekao) { Log ("  [.] prijenos je zavrsio dok se cekalo na lijepljenje - putanja ostaje u Primljeno\") }
-    if ($rx.Grupa -and $rx.Grupa.Preostalo -le 0) { $script:Grupa = $null }
-    return
-  }
-
-  if ($rx.ClipGrupa -and $rx.Grupa -and $rx.Grupa.Preostalo -le 0) {
-    if (Postavi-Datoteke $rx.Grupa.Putanje) {
-      Log ("  <- u meduspremnik stavljeno {0} datoteka" -f $rx.Grupa.Putanje.Count)
-      # Hash se racuna iz poslanog popisa, a meduspremnik se NE cita ponovno -
-      # vidi Zapamti-Poznati. Time u prozoru prije korisnikovog Ctrl+V nema
-      # nijednog OleGetClipboard() poziva iz Luxstreama.
-      Zapamti-Poznati @{ Vrsta = 'files'; Datoteke = $rx.Grupa.Putanje }
-    }
-    $script:Grupa = $null
-  }
+  if ($kratko) { Log $kratko }
 }
 
 function Nadji-Proces {
@@ -1205,6 +2035,11 @@ if ($SelfTest) {
   New-Item -ItemType Directory -Path $tmp -Force | Out-Null
   $uspjeh = $true
 
+  # Ugnijezdjeni C# (kanal za datoteke) sastavlja se odmah: ako ne prodje,
+  # 3b ce to prijaviti kao [FAIL], ali se greska vidi i ovdje, s pravim
+  # razlogom - a ne kao niz nerazumljivih "nije pronadjeno".
+  Init-LuxClip | Out-Null
+
   function T($ime, $uvjet) {
     if ($uvjet) { Say ("  [OK]   " + $ime) } else { Say ("  [FAIL] " + $ime); $script:uspjeh = $false }
   }
@@ -1325,47 +2160,104 @@ $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
           ((Get-FileHash $izvor -Algorithm MD5).Hash -eq (Get-FileHash $odred -Algorithm MD5).Hash)
   T 'sadrzaj datoteke identican (MD5)' $isti
 
-  # 3b. JEZGRO cekanja na lijepljenje. Cijeli mehanizam stoji na jednom:
-  #     datoteka otvorena za pisanje mora prezivjeti PREIMJESTANJE, a nas
-  #     drzac mora nastaviti pisati u nju na novom mjestu. Explorer zalijepljenu
-  #     datoteku na istom disku samo preimenuje, pa se time i dokazuje da je
-  #     korisnik zalijepio (putanja iz Primljenog nestane).
+  # 3b. JEZGRO kanala: opisnik (FileGroupDescriptorW) koji ide meduspremniku.
+  #     Cijeli mehanizam stoji na rucno slozenim bajtovima - FILEDESCRIPTOR je
+  #     tocno 592 B po datoteci, a Explorer ga cita po fiksnim pomacima. Jedan
+  #     pomaknut bajt znaci opisnik koji Windows procita kao smece (ili, gore,
+  #     kao ime iz susjedne datoteke). Zato se svaki pomak provjerava izricito.
   #
-  #     Ako ovo padne, pada i cijela zamisao - zato se provjerava izricito, a
-  #     ne prepusta vjeri u dokumentaciju.
-  $lz   = Join-Path $tmp 'lazy-izvor.bin'
-  $lzKamo = Join-Path $tmp 'lazy-odrediste.bin'
-  [System.IO.File]::WriteAllBytes($lz, (New-Object byte[] 1024))
-  $lzFs = New-Object System.IO.FileStream -ArgumentList @(
-    $lz, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write,
-    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
-  $lzFs.SetLength(4096)
-  T 'velicina se rezervira prije prijenosa' ((Get-Item -LiteralPath $lz).Length -eq 4096)
-  [System.IO.File]::Move($lz, $lzKamo)
-  T 'datoteka se dala premjestiti dok je drzac otvoren' (Test-Path -LiteralPath $lzKamo)
-  $lzFs.Write([byte[]](1,2,3,4), 0, 4)
-  $lzFs.Flush()
-  # Citanje MORA ici kroz FileShare.ReadWrite. Nas drzac drzi datoteku otvorenu
-  # za pisanje, a [System.IO.File]::ReadAllBytes trazi FileShare.Read - s nasim
-  # drzacem se to ne poklapa i pukne na "datoteka je u upotrebi". Isti uvjet
-  # vrijedi za svakoga tko zeli citati sadrzaj dok prijenos traje (npr.
-  # antivirus ili preglednik minijatura) - zato je drzac otvoren s ReadWrite.
-  $lzCit = New-Object System.IO.FileStream -ArgumentList @(
-    $lzKamo, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
-    ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
-  $lzPrvi = $lzCit.ReadByte()
-  $lzCit.Dispose()
-  T 'pisanje ide u PREMJESTENU datoteku' ($lzPrvi -eq 1)
-  $lzFs.SetLength(4)
-  $lzFs.Flush()
-  T 'skracivanje kroz drzac radi i nakon premjestanja' ((Get-Item -LiteralPath $lzKamo).Length -eq 4)
-  $lzPut = Putanja-Rukovanja $lzFs
-  if ($lzPut) {
-    T 'putanja iz drzaca pokazuje na premjestenu datoteku' ($lzPut -like '*lazy-odrediste.bin')
+  #     Ako ovo padne, kanal ne radi: datoteke ostanu u Primljeno\ i korisnik
+  #     ih mora premjestiti rucno. Zato se ne prepusta vjeri u dokumentaciju.
+  if (-not $script:LuxTip) {
+    T 'kanal: LuxShim se sastavio' $false
+    Say ('  [!] ' + $script:LuxGreska)
   } else {
-    Say '  [..]   putanja iz drzaca nije dostupna - ukras u dnevniku, nije greska'
+    T 'kanal: LuxShim se sastavio' $true
+
+    # Dvije datoteke, namjerno razlicite: prva mala, druga iznad 4 GB - da se
+    # vidi da nFileSizeHigh nije uvijek nula (tamo se lomi najlakse).
+    $v1 = 1234
+    $v2 = [int64]5368709197            # 5 GB + 77 B
+    $opisTest = ("C:\x\a.txt`tpocetak/a.txt`t" + $v1 + "`n" +
+                 "C:\x\b.txt`tpocetak/pod/b.txt`t" + $v2 + "`n")
+    $bz = [LuxShim.LuxClip]::OpisnikZaTest($opisTest)
+
+    T 'opisnik: velicina = 4 + N*592' ($bz.Length -eq (4 + 2 * 592))
+
+    $cItems = [BitConverter]::ToUInt32($bz, 0)
+    T 'opisnik: cItems nosi broj datoteka' ($cItems -eq 2)
+
+    # --- prva datoteka (pomaci su ono na cemu sve visi) ---
+    $o = 4
+    $flags1 = [BitConverter]::ToUInt32($bz, $o + 0)
+    T 'opisnik: FD_UNICODE postavljen (ime je UTF-16)' (($flags1 -band 0x80000000) -ne 0)
+    T 'opisnik: FD_FILESIZE postavljen'                (($flags1 -band 0x40) -ne 0)
+    T 'opisnik: FD_WRITESTIME postavljen'              (($flags1 -band 0x20) -ne 0)
+
+    $attr1 = [BitConverter]::ToUInt32($bz, $o + 36)
+    T 'opisnik: atribut FILE_ATTRIBUTE_NORMAL' ($attr1 -eq 0x80)
+
+    $ft1 = [BitConverter]::ToUInt64($bz, $o + 56)
+    T 'opisnik: ftLastWriteTime nije nula' ($ft1 -gt 0)
+
+    $lo1 = [BitConverter]::ToUInt32($bz, $o + 68)
+    $hi1 = [BitConverter]::ToUInt32($bz, $o + 64)
+    T 'opisnik: nFileSizeLow prve'  ($lo1 -eq $v1)
+    T 'opisnik: nFileSizeHigh prve' ($hi1 -eq 0)
+
+    $ime1 = [Text.Encoding]::Unicode.GetString($bz, $o + 72, 10)   # "a.txt" = 5 WCHAR
+    T 'opisnik: ime prve, UTF-16, s podmapom' ($ime1 -eq 'pocet')
+
+    # --- druga datoteka: 5 GB + 77 B, ime "b.txt" u podmapi ---
+    $o = 4 + 592
+    $lo2 = [BitConverter]::ToUInt32($bz, $o + 68)
+    $hi2 = [BitConverter]::ToUInt32($bz, $o + 64)
+    T 'opisnik: nFileSizeLow druge'  ($lo2 -eq 1073741901)
+    T 'opisnik: nFileSizeHigh druge (5 GB)' ($hi2 -eq 1)
+    $ime2 = [Text.Encoding]::Unicode.GetString($bz, $o + 72, 38)   # "pocetak/pod/b.txt"
+    $ime2 = $ime2.Substring(0, $ime2.IndexOf([char]0))
+    T 'opisnik: ime druge nosi podmapu' ($ime2 -eq 'pocetak/pod/b.txt')
+
+    # --- isti opisnik mora izaci i kroz GetData (HGLOBAL), ne samo iz ruke ---
+    $bg = [LuxShim.LuxClip]::MedijZaTest($opisTest, -1)
+    T 'opisnik: GetData daje isti opisnik' (
+      ($bg.Length -eq $bz.Length) -and
+      ([Convert]::ToBase64String($bg) -eq [Convert]::ToBase64String($bz)))
+
+    # --- koje formate nudimo: fgdw + po jedan filecontents po datoteci + pdde ---
+    $nFmt = [LuxShim.LuxClip]::FormatEtaBrojZaTest()
+    T 'kanal: nudi 3 formata za jednu datoteku' ($nFmt -eq 3)
+
+    # --- struja: sadrzaj mora izaci citan s diska, u komadima, tocno u cijelosti ---
+    $stIzvor = Join-Path $tmp 'struja.bin'
+    $stBytes = New-Object byte[] 300000
+    (New-Object Random 7).NextBytes($stBytes)
+    [System.IO.File]::WriteAllBytes($stIzvor, $stBytes)
+
+    $buf = New-Object byte[] 65536
+    $pn  = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
+    $ms  = New-Object System.IO.MemoryStream
+    $citanja = 0
+    try {
+      $ls = New-Object LuxShim.LuxStream -ArgumentList @($stIzvor, 0, [int64]$stBytes.Length)
+      while ($citanja -lt 1000) {
+        $ls.Read($buf, $buf.Length, $pn)
+        $got = [Runtime.InteropServices.Marshal]::ReadInt32($pn)
+        if ($got -le 0) { break }
+        $ms.Write($buf, 0, $got)
+        if ($got -lt $buf.Length) { break }      # zadnji komad
+        $citanja++
+      }
+    } finally {
+      [Runtime.InteropServices.Marshal]::FreeHGlobal($pn)
+    }
+    T 'struja: zadnji Read javlja kraj (0 B)' ($got -le 0)
+    T 'struja: procitano u komadima, ne odjednom' ($citanja -ge 4)
+    T 'struja: sadrzaj identican izvoru' (
+      ([Convert]::ToBase64String($ms.ToArray()) -eq [Convert]::ToBase64String($stBytes)))
+    $ms.Dispose()
   }
-  $lzFs.Dispose()
+
 
   # 3c. PAUZA / NASTAVI kroz pravi spoj
   Send-Frame $b 0x30 (Utf8 (Json-Ukratko @{ name = 'x.iso'; size = 123 }))
@@ -1696,14 +2588,31 @@ function Vrti-Klijenta {
 }
 
 # ------------------------------------------------------------------ sync loop
-function Sync-Loop($klijent, $stream, [string]$uloga) {
-  # Ostatak prijenosa iz PROSLOG spoja: ako je veza pukla usred primanja,
-  # drzac je ostao otvoren. Bez ovoga bi se na svakom prekidu izgubio jedan
-  # drzac datoteke - a kod cekanja na lijepljenje i datoteka puna nula koja
-  # nikad ne ode.
+# Zatvara sve sto je jedan spoj mogao ostaviti otvoreno: drzac datoteke u
+# prijenosu, kanal u meduspremniku i nedovrsenu grupu u Primljeno\.
+#
+# Redoslijed je vazan: kanal se zatvara PRIJE brisanja. U njemu je proxy na
+# ovaj proces, pa bi cilj inace mogao citati datoteku u trenutku dok je
+# brisemo.
+function Zatvori-Sve {
   if ($script:Rx -and $script:Rx.Fs) { try { $script:Rx.Fs.Dispose() } catch { } }
-  $script:Rx    = $null      # datoteka koja se upravo prima
-  $script:Grupa = $null      # grupa koja se upravo prima (za meduspremnik)
+  $script:Rx = $null
+  if ($script:LuxTip) { try { [LuxShim.LuxClip]::Ocisti() } catch { } }
+  if ($script:Grupa) {
+    Ocisti-Primljeno $script:Grupa
+    $script:Grupa = $null
+  }
+}
+
+function Sync-Loop($klijent, $stream, [string]$uloga) {
+  # Ostatak iz PROSLOG spoja. Ako je veza pukla usred prijenosa, drzac je
+  # ostao otvoren, kanal postavljen, a grupa nedovrsena - pa bi se na svakom
+  # prekidu izgubio jedan drzac, a u Primljeno\ ostala datoteka koju nitko ne
+  # moze zalijepiti (kanal je vec mrtav).
+  $biloGrupe = [bool]$script:Grupa
+  Zatvori-Sve
+  if ($biloGrupe) { Log '  [!] prethodna grupa nije dovrsena - pocisceno iz Primljeno\' }
+
   $script:Odgoda = $null     # tekst/slika koji cekaju kraj pauze (vidi Odgodi-Meduspremnik)
   $zadnjiDrop = @{}          # sto je iz Drop-a vec poslano (ime|duljina|vrijeme)
   $script:ZadnjiHash = Prezivjeli-Hash (Dohvati-Meduspremnik)
@@ -1711,22 +2620,23 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
 
   Log 'veza uspostavljena - sinkroniziram'
 
+  try {
   while ($klijent.Connected) {
     # Mrtva veza se mora primijetiti i kad se nista ne salje. Bez ovoga bi
     # klijent ostao u petlji nad zatvorenom uticnicom - vidi Test-Veza.
     if (-not (Test-Veza $klijent $stream)) { throw 'veza zatvorena' }
 
-    # ---- 0. je li korisnik zalijepio?
+    # ---- 0. meduspremnik: je li grupa zalijepljena?
     #
-    # Provjera ide prije svega ostaloga: dok se ceka, posiljatelj je zaustavljen
-    # pa ionako nema dolaznog prometa, a sto se prije posalje NASTAVI to prije
-    # krece pravi prijenos. Kad pauze nema, funkcija odmah izlazi.
-    if ($script:Rx -and $script:Rx.Ceka) {
-      Provjeri-Lijepljenje $script:Rx $stream
+    # Provjera ide prije dolaznog prometa. Dok opisnik stoji, posiljatelj
+    # ionako salje punom brzinom, pa nema sto cekati - a sto se prije primijeti
+    # kraj citanja, to se prije kanal zatvori i Primljeno\ pocisti.
+    if ($script:Grupa -and $script:Grupa.Opisnik) {
+      Provjeri-Opisnik $script:Grupa
     }
-    # Odgodjeni tekst/slika se primjenjuju cim pauze vise nema. Provjera ide
-    # svaki okretaj, a funkcija odmah izlazi kad nema nista odgodjeno.
-    if (-not ($script:Rx -and $script:Rx.Ceka)) { Primijeni-Odgodu }
+    # Odgodjeni tekst/slika se primjenjuju cim kanal vise nije zauzet. Provjera
+    # ide svaki okretaj, a funkcija odmah izlazi kad nema nista odgodjeno.
+    if (-not ($script:Grupa -and $script:Grupa.Opisnik)) { Primijeni-Odgodu }
 
     # ---- 1. dolazno
     try {
@@ -1738,9 +2648,9 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           0x10 {
             $t = [Text.Encoding]::UTF8.GetString($f.Payload)
             if ($t.Length -le $MaxTextBytes) {
-              # Dok se ceka na lijepljenje, meduspremnik drzi putanju datoteke
-              # koju korisnik upravo lijepi - tekst preko toga pojede upravo to.
-              if ($script:Rx -and $script:Rx.Ceka) {
+              # Dok opisnik stoji, meduspremnik drzi datoteke koje korisnik
+              # upravo lijepi - tekst preko toga pojede upravo njih.
+              if ($script:Grupa -and $script:Grupa.Opisnik) {
                 Odgodi-Meduspremnik 'text' $t
               } elseif (Postavi-Tekst $t) {
                 $p = if ($t.Length -gt 40) { $t.Substring(0,40) + '...' } else { $t }
@@ -1751,7 +2661,7 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           }
           0x11 {
             if ($f.Payload.Length -le $MaxImageBytes) {
-              if ($script:Rx -and $script:Rx.Ceka) {
+              if ($script:Grupa -and $script:Grupa.Opisnik) {
                 Odgodi-Meduspremnik 'image' $f.Payload
               } elseif (Postavi-Sliku $f.Payload) {
                 Log ("  <- slika {0} B" -f $f.Payload.Length)
@@ -1763,16 +2673,71 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           }
           0x12 {
             $g = [Text.Encoding]::UTF8.GetString($f.Payload) | ConvertFrom-Json
-            $script:Grupa = @{ Preostalo = [int]$g.count; Putanje = @() }
+            # Grupa se pamti u cjelini: opisnik mora nositi ime i velicinu SVAKE
+            # datoteke, pa se popis stavki gradi dok zaglavlja pristizu, a
+            # meduspremnik se postavlja tek kad ih stigne tocno "count" - vidi
+            # Postavi-Opisnik. "Preostalo" je ukinuto: ono je brojalo komade
+            # sadrzaja, a kanal sada radi iz zaglavlja, ne iz komada.
+            $script:Grupa = @{
+              Stavke     = @()      # @{ Ime; Put; Vel; Rel } - jedna po datoteci
+              Slovar     = @{}      # ime -> indeks u Stavke (za uklanjanje dvojnika)
+              Zaglavlja  = 0        # koliko je okvira 0x20 stiglo
+              Ocekivano  = [int]$g.count
+              Opisnik    = $null    # $true kad je meduspremnik postavljen
+              OpisnikOd  = $null    # kad je postavljen (za rok i dnevnik)
+              SmirenjeOd = $null    # kad je cilj poceo citati (predah prije zatvaranja)
+              Ukupno     = [int64]$g.ukupno
+            }
             Log ("  <- najava grupe: {0} datoteka, {1} MB" -f $g.count, [math]::Round($g.ukupno/1MB,1))
           }
           0x20 {
             $h = [Text.Encoding]::UTF8.GetString($f.Payload) | ConvertFrom-Json
             $odred = Odredi-Odrediste $h
-            # Novi-Prijem odlucuje hoce li se na ovu datoteku cekati Ctrl+V, i
-            # ako hoce - odmah postavlja meduspremnik i salje PAUZU.
-            $script:Rx = Novi-Prijem $odred $h $stream
-            if ($script:Grupa) { $script:Grupa.Putanje += $odred }
+            # Nista se ne najavljuje unaprijed i nista se ne napuhava: datoteka
+            # se pise svojom stvarnom velicinom (vidi Novi-Prijem). Meduspremnik
+            # se postavlja tek kad su poznata SVA zaglavlja - vidi Postavi-Opisnik.
+            $script:Rx = Novi-Prijem $odred $h
+            $rx = $script:Rx
+
+            # Grupa postoji samo ako je najava (0x12) stigla prije zaglavlja.
+            # Ako nije - ovo je samostalna datoteka; i za nju se pravi grupa od
+            # jednog clana, da prodje kroz isti kanal (i da se poslije pocisti).
+            if (-not $script:Grupa) {
+              $script:Grupa = @{
+                Stavke     = @()
+                Slovar     = @{}
+                Zaglavlja  = 0
+                Ocekivano  = 1
+                Opisnik    = $null
+                OpisnikOd  = $null
+                SmirenjeOd = $null
+                Ukupno     = [int64]$h.size
+              }
+            }
+            $grupa = $script:Grupa
+
+            # Kljuc za uklanjanje dvojnika je IME, a ne "rel": kod mape se
+            # njezin naziv ponavlja u "rel" svake datoteke, pa bi kao kljuc
+            # spojio razlicite datoteke iste mape.
+            $ime = [string]$h.name
+            if (-not $grupa.Slovar.ContainsKey($ime)) {
+              $relKljuc = ([string]$h.rel -replace '\\', '/')
+              if ([string]::IsNullOrWhiteSpace($relKljuc)) { $relKljuc = (Ocisti-Ime $ime) }
+              $grupa.Slovar[$ime] = $grupa.Stavke.Count
+              $grupa.Stavke = @($grupa.Stavke) + @{ Ime = $ime; Put = $odred; Vel = [int64]$h.size; Rel = $relKljuc }
+            }
+            # lindex u opisniku je redni broj stavke; LuxStream po njemu zna
+            # koju datoteku cita - vidi LuxShim.
+            $rx.Indeks = $grupa.Slovar[$ime]
+
+            # Zaglavlja se broje odvojeno od Stavke: dvojnik imena ne smije
+            # blokirati sastavljanje opisnika (Stavke ne bi rasla, a Zaglavlja
+            # bi - pa se broji ono sto je stvarno stiglo).
+            $grupa.Zaglavlja = $grupa.Zaglavlja + 1
+
+            # Ako je ovo zadnje zaglavlje grupe, kanal se otvara odmah - ne
+            # ceka se ni jedan bajt sadrzaja.
+            Postavi-Opisnik $grupa
           }
           0x21 {
             if (-not $script:Rx) { throw 'komad bez najave datoteke' }
@@ -1781,9 +2746,10 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           }
           0x22 {
             if ($script:Rx) {
-              $rx = $script:Rx
-              if ($rx.Grupa) { $rx.Grupa.Preostalo-- }
-              Zavrsi-Primanje $rx $stream
+              # Zavrsi-Primanje zatvara drzac i javlja kanalu da je ova datoteka
+              # gotova - od tog trenutka njezina struja daje kraj (vidi LuxShim).
+              # Grupa se NE umanjuje: kanal se drzi dok cilj ne procita sve.
+              Zavrsi-Primanje $script:Rx
             }
           }
           0x30 {
@@ -1805,14 +2771,14 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
 
     # ---- 2. odlazno: meduspremnik
     #
-    # Dok se ceka na lijepljenje ovaj je meduspremnik ZAUZET: u njemu je putanja
-    # datoteke koju korisnik upravo lijepi (vidi Novi-Prijem). Slanje onoga sto
-    # je u njemu u tom trenutku poslalo bi tu istu putanju natrag, a na drugoj
-    # bi strani to postalo novi sadrzaj njezinog meduspremnika. Hash se zato ne
-    # trosi - sve sto je korisnik kopirao za vrijeme pauze ide van odmah nakon
-    # sto ona zavrsi.
+    # Dok opisnik stoji, meduspremnik je ZAUZET: u njemu su datoteke koje
+    # korisnik upravo lijepi, a citaju se iz ovog procesa (proxy na nasu
+    # struju). Poslati u tom trenutku bilo sto iz naseg meduspremnika znacilo
+    # bi pregaziti upravo taj opisnik - i korisnikovo lijepljenje bi puklo.
+    # Hash se zato ne trosi: sve sto je korisnik kopirao za vrijeme dok kanal
+    # stoji ide van odmah nakon sto se kanal zatvori.
     if (-not $NoClipboard -and (Get-Date) -gt $script:PreskociDo -and
-        -not ($script:Rx -and $script:Rx.Ceka)) {
+        -not ($script:Grupa -and $script:Grupa.Opisnik)) {
       $s = Dohvati-Meduspremnik
       $h = Prezivjeli-Hash $s
       if ($h -ne $script:ZadnjiHash -and $h -ne 'N') {
@@ -1852,7 +2818,11 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
     }
 
     # ---- 3. odlazno: mapa Drop
-    if (-not $NoFiles) {
+    #
+    # Dok je grupa u tijeku (zaglavlja pristizu ili opisnik stoji) ne salje se
+    # nista iz Drop-a: jedan spoj nosi jedan prijenos, pa bi umijesani okviri
+    # pokvarili i primanje i slanje.
+    if (-not $NoFiles -and -not $script:Grupa) {
       try {
         $novi = @(Get-ChildItem -LiteralPath $drop -File -ErrorAction SilentlyContinue | Sort-Object Name)
         foreach ($fi in $novi) {
@@ -1869,9 +2839,21 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
 
     Start-Sleep -Milliseconds $PollMs
   }
+
+  # Veza je pukla (ili se gasimo) - sve sto je ostalo otvoreno zatvara se
+  # ovdje, pa sljedeci spoj pocinje cist.
+  } finally {
+    $biloGrupe = [bool]$script:Grupa
+    Zatvori-Sve
+    if ($biloGrupe) { Log '  [.] veza prekinuta usred grupe - pocisceno iz Primljeno\' }
+  }
 }
 
 switch ($Mode) {
-  'Server' { Vrti-Posluzitelj }
-  'Client' { Vrti-Klijenta }
+  # Ugnijezdjeni C# se sastavlja prije prve veze, a ne u njoj: sastavljanje
+  # zna potrajati, a u Sync-Loopu bi taj zastoj izgledao kao mrtva veza.
+  # Ako sastavljanje padne, Init-LuxClip to zapise u dnevnik, a most i dalje
+  # radi - samo bez kanala (datoteke ostanu u Primljeno\).
+  'Server' { Init-LuxClip | Out-Null; Vrti-Posluzitelj }
+  'Client' { Init-LuxClip | Out-Null; Vrti-Klijenta }
 }

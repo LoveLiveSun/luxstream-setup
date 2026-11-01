@@ -264,14 +264,27 @@ TCP, so it works with any Sunshine and Moonlight version:
 | **file copied in Explorer** | Ctrl+C on a file, Ctrl+V on the other side pastes the file itself |
 | **file via a folder** | drop it into `%USERPROFILE%\Luxstream\Drop\`; it leaves that folder and appears in `Luxstream\Primljeno\` on the other side |
 
-**A large file starts moving on Ctrl+V.** Ctrl+C only announces the file — the bytes
-begin moving when it is pasted, because that is when the destination is known. Above
-8 MB the VM immediately creates the destination at its full size and puts it on the
-clipboard, so Ctrl+V works right away (a 6.5 GB ISO used to take 3 min 19 s). The host's
-progress window then shows `čeka se lijepljenje (Ctrl+V)`, and after the paste the
-transfer runs at full speed straight into the chosen location. Paste **within the same
-volume** — across volumes Explorer copies instead of moving, and that copy is taken
-while the file is still empty.
+**A whole group pastes in one Ctrl+V, and the file is never copied empty.** The VM does
+not put a *path* on its clipboard. It builds a clipboard **file group** — a descriptor
+listing every file's name and size, plus one content stream per file
+(`FileGroupDescriptorW` + `FileContents`), the same mechanism RDP and VMware use. Explorer
+therefore reads the content out of the stream the bridge hands it and never touches the
+file in `Primljeno\`. Two things follow:
+
+* pasting **anywhere** — including onto another drive — yields a complete file: there is
+  no copy-then-delete that could run while the file is still empty;
+* a **copied folder and any multi-file selection land in a single Ctrl+V**, keeping the
+  subfolder structure.
+
+The host sends all the group's headers first, so the clipboard is ready as soon as the
+selection is announced, whatever its size. A file whose bytes are still arriving is not
+truncated — if the listener reads faster than the link delivers, it waits — and Ctrl+V
+takes effect as soon as the transfer it is waiting on finishes. Once every file has been
+read to the end, the channel is withdrawn and `Primljeno\` is cleaned up by itself. If
+nobody pastes within 10 minutes the channel is withdrawn instead and the files stay in
+`Primljeno\`; nothing is ever discarded behind your back.
+
+Files dropped into `Drop\` take the plain single-file path and are unaffected.
 
 ### Host listens, VM connects
 
@@ -331,9 +344,14 @@ clipboard is invisible.
 
 # self-test with no outside connection - real TCP on 127.0.0.1: text with
 # diacritics both ways, a PNG, a 700 KB file crossing the 256 KB chunk
-# boundary (MD5), and name sanitising
+# boundary (MD5), name sanitising, and the clipboard file descriptor checked
+# byte by byte (offsets, FD_UNICODE, sizes above 4 GB) plus the content stream
 .\scripts\luxstream-bridge.ps1 -SelfTest
 ```
+
+The `-SelfTest` descriptor check is worth running first on a machine where file pasting
+misbehaves: it is the only part that fails loudly, and the descriptor is hand-written
+byte-for-byte (`FILEDESCRIPTOR` is 592 bytes per file, at fixed offsets).
 
 Log: `%USERPROFILE%\Luxstream\luxstream-bridge.log`. It also records **why the bridge did
 not start** (missing secret, for instance) — otherwise a failure inside a hidden

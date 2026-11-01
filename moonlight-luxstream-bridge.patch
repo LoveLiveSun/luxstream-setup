@@ -22,17 +22,44 @@ The protocol (1 byte type, 4 byte little-endian length, payload):
   0x20 file header         (JSON {name, size, rel?})
   0x21 file chunk          (256 KB)
   0x22 file end
-  0x30 PAUZA  - receiver asks the sender to stop pushing (JSON {name, size})
-  0x31 NASTAVI - receiver asks the sender to continue (empty)
+  0x30 PAUZA  - vestigial, logged only   (JSON {name, size})
+  0x31 NASTAVI - vestigial, logged only  (empty)
 
-0x30 / 0x31 were added on 01.11.2026.  They exist because Ctrl+C starts the
-copy: an ISO takes minutes to reach the VM, so a Ctrl+V typed while the bytes
-are still moving pastes whatever was on the clipboard *before*.  With these two
-frames the VM creates the destination file up front, puts the file on its
-clipboard immediately and asks the host to hold; the host stops feeding the
-socket, and the transfer runs at full speed once the user actually pastes.  A
-peer that does not know the frames logs "nepoznat tip okvira" and ignores them,
-so mixing versions degrades to the old behaviour instead of breaking.
+HOW A PASTE WORKS NOW (changed 01.11.2026)
+
+The VM no longer puts a *path* on its clipboard.  It builds a clipboard file
+group (FileGroupDescriptorW plus one FileContents stream per file) - the same
+thing RDP and VMware do - so Explorer copies out of the stream we hand it and
+never touches our file.  That removes two defects at once:
+
+  * pasting onto another drive produced a 0-byte file, because Explorer's
+    cross-volume "move" is copy-then-delete, and the copy ran while our file
+    was still empty;
+  * only one file per group could be pasted lazily, so a copied folder ended up
+    stranded in Primljeno\.
+
+A descriptor has to list the name and size of *every* file, so the receiver must
+have all the group's headers before it can publish anything.  That is why this
+patch sends the whole group's 0x20 headers up front, in one burst from
+pollClipboard, before a single byte of content goes out.  pumpSend skips a
+header that has already gone (TxItem::headerSent).  Without this the user could
+only paste after every file but the last had been transferred - the entire
+transfer, for a folder.
+
+Drop files and single files are unaffected: their header is still sent by
+pumpSend immediately before the first chunk.
+
+0x30 / 0x31 (PAUZA / NASTAVI) were added on 01.11.2026 for the earlier "hold the
+transfer until the paste happens" design.  The clipboard-group design does not
+need them: the whole point of it is that the receiver waits for nothing, because
+the listener pulls the bytes.  They are still parsed and logged so that an older
+peer is not surprised, but nothing sends them any more.
+
+The two sides therefore upgrade independently in one direction only: a new VM
+with an old host still works (headers arrive interleaved with data; the receiver
+just builds its descriptor later, and the user pastes later), while a new host
+with an old VM also works (the old VM ignores the extra up-front headers as
+ordinary headers and keeps its per-file accounting).
 
 Apply from the root of a moonlight-qt checkout:
   git apply moonlight-luxstream-bridge.patch
@@ -70,10 +97,10 @@ index 1c0661b..f2373c4 100644
      cli/listapps.h \
 diff --git a/app/backend/luxbridge.cpp b/app/backend/luxbridge.cpp
 new file mode 100644
-index 0000000..217235a
+index 0000000..a84c925
 --- /dev/null
 +++ b/app/backend/luxbridge.cpp
-@@ -0,0 +1,2008 @@
+@@ -0,0 +1,2034 @@
 +// NOMINMAX has to be set before anything pulls in <windows.h>, or the min/max
 +// macros it defines eat std::min/std::max and Qt's own use of them.
 +#ifdef _WIN32
@@ -1258,6 +1285,20 @@ index 0000000..217235a
 +    }
 +}
 +
++// Najava jedne datoteke: ime, velicina i - samo za datoteke iz kopirane mape -
++// relativna putanja. Stariji sugovornik nepoznati kljuc ignorira i slozi
++// datoteku ravno; to je staro ponasanje, a ne greska.
++void LuxBridge::sendFileHeader(Connection* conn, const TxItem& item)
++{
++    QJsonObject header;
++    header.insert(QStringLiteral("name"), item.name);
++    header.insert(QStringLiteral("size"), static_cast<double>(item.size));
++    if (!item.rel.isEmpty()) {
++        header.insert(QStringLiteral("rel"), item.rel);
++    }
++    sendFrame(conn, kFrameFileHeader, QJsonDocument(header).toJson(QJsonDocument::Compact));
++}
++
 +bool LuxBridge::queueFile(Connection* conn, TxItem item)
 +{
 +    if (conn == nullptr) {
@@ -1331,16 +1372,12 @@ index 0000000..217235a
 +            conn->txCurrent = item;
 +            conn->txSent = 0;
 +
-+            QJsonObject header;
-+            header.insert(QStringLiteral("name"), item.name);
-+            header.insert(QStringLiteral("size"), static_cast<double>(item.size));
-+            if (!item.rel.isEmpty()) {
-+                // Only sent for files that came out of a copied folder. An
-+                // older peer simply ignores the extra key and lands them flat,
-+                // which is the old behaviour rather than a failure.
-+                header.insert(QStringLiteral("rel"), item.rel);
++            // Zaglavlje grupe iz meduspremnika je vec poslano - vidi
++            // pollClipboard. Za sve ostalo (Drop, pojedinacna datoteka) ide
++            // ovdje, neposredno prije prvog komada.
++            if (!item.headerSent) {
++                sendFileHeader(conn, item);
 +            }
-+            sendFrame(conn, kFrameFileHeader, QJsonDocument(header).toJson(QJsonDocument::Compact));
 +
 +            conn->txFile.setFileName(item.path);
 +            if (!conn->txFile.open(QIODevice::ReadOnly)) {
@@ -1817,9 +1854,17 @@ index 0000000..217235a
 +
 +            int spremno = 0;
 +            qint64 spremnoBajtova = 0;
++            QVector<TxItem> spremni;
 +            for (const QPair<QString, QString>& e : items) {
 +                const QFileInfo fi(e.first);
 +                if (fi.exists() && fi.isFile()) {
++                    TxItem item;
++                    item.path = e.first;
++                    item.rel = e.second;
++                    item.name = fi.fileName();
++                    item.size = fi.size();
++                    item.fromClipboard = true;
++                    spremni.append(item);
 +                    spremno++;
 +                    spremnoBajtova += fi.size();
 +                }
@@ -1828,12 +1873,20 @@ index 0000000..217235a
 +            conn->grpLeft += spremno;
 +            conn->grpBytes += spremnoBajtova;
 +
++            // Zaglavlja CIJELE grupe idu prva, sva jedno za drugim, prije
++            // ijednog bajta podataka. Druga strana iz njih sastavlja opisnik
++            // meduspremnika (FileGroupDescriptorW) i mora ga imati cijelog
++            // prije nego korisnik stisne Ctrl+V. Da zaglavlja idu isprepletena
++            // s podacima - kako pumpSend inace radi - korisnik bi mogao
++            // zalijepiti tek kad su sve datoteke osim zadnje vec poslane; kod
++            // kopirane mape s tisucama datoteka to je cijeli prijenos.
++            for (const TxItem& item : spremni) {
++                sendFileHeader(conn, item);
++            }
++
 +            int queued = 0;
-+            for (const QPair<QString, QString>& e : items) {
-+                TxItem item;
-+                item.path = e.first;
-+                item.rel = e.second;
-+                item.fromClipboard = true;
++            for (TxItem item : spremni) {
++                item.headerSent = true;
 +                if (queueFile(conn, item)) {
 +                    queued++;
 +                }
@@ -2084,10 +2137,10 @@ index 0000000..217235a
 +}
 diff --git a/app/backend/luxbridge.h b/app/backend/luxbridge.h
 new file mode 100644
-index 0000000..80c58f5
+index 0000000..0d48ee2
 --- /dev/null
 +++ b/app/backend/luxbridge.h
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,373 @@
 +#pragma once
 +
 +#include <QByteArray>
@@ -2202,6 +2255,14 @@ index 0000000..80c58f5
 +        // Files that came out of a copied clipboard group are counted, so the
 +        // group summary is logged once, when the last of them is on the wire.
 +        bool fromClipboard = false;
++
++        // Postavlja se kad je zaglavlje ove datoteke vec poslano izvan
++        // pumpSend-a - vidi pollClipboard. Zaglavlja CIJELE grupe idu prva,
++        // jedno za drugim, prije ijednog bajta podataka. Bez toga bi druga
++        // strana znala samo za datoteku koja je upravo na redu, pa bi opisnik
++        // meduspremnika mogla sastaviti tek kad su sve osim zadnje datoteke
++        // vec poslane - kod mape s tisucama datoteka to je cijeli prijenos.
++        bool headerSent = false;
 +    };
 +
 +    struct Connection
@@ -2276,6 +2337,10 @@ index 0000000..80c58f5
 +    // the file is gone or over the size policy - the same verdict the old
 +    // synchronous sender handed back. Name and size are filled in here, so a
 +    // caller only has to say where the file is and what to do once it is out.
++    // Najava jedne datoteke (0x20). Odvojeno od queueFile-a jer zaglavlja
++    // cijele grupe idu prva - vidi pollClipboard i TxItem::headerSent.
++    void sendFileHeader(Connection* conn, const TxItem& item);
++
 +    bool queueFile(Connection* conn, TxItem item);
 +
 +    // Fills the socket's write buffer from the queue until the high-water mark

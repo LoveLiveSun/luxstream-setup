@@ -181,8 +181,14 @@ if (Test-Path $unrar) {
   # C:\Program Files\Luxstream i prema njemu napravi precac u Start izborniku.
   # Bez njega u paketu korisnik ostane bez nacina da ovo sve ukloni, pa se
   # build ovdje prekida umjesto da se tiho isporuci nepotpun instalater.
+  #
+  # Most (scripts\luxstream-bridge.ps1) je jednako obavezan: bez njega nema
+  # prijenosa datoteka ni meduspremnika, a INSTALL.ps1 ga samo preslika iz
+  # paketa - dakle bez njega se isporuci instalater kojemu pola funkcija
+  # nedostaje, i to bez ijedne greske pri instalaciji.
   foreach ($n in 'INSTALL.cmd', 'INSTALL.ps1', 'UNINSTALL.ps1', 'Luxstream-ODINSTALIRAJ.cmd',
-                 'UNINSTALL.cmd', 'installers\sunshine\Sunshine.exe') {
+                 'UNINSTALL.cmd', 'installers\sunshine\Sunshine.exe',
+                 'scripts\luxstream-bridge.ps1') {
     if ($popis -contains $n) { Ok "in archive: $n" } else { Bad "MISSING: $n" }
   }
   $msiU = @($popis | Where-Object { $_ -like 'installers\sunshine\*.msi' })

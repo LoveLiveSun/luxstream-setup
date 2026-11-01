@@ -364,13 +364,25 @@ verzijom Sunshinea i Moonlighta. Prenosi:
 
 Most zamjenjuje stari `clipboard-bridge.ps1`, koji je prenosio samo tekst.
 
-**Velika datoteka: prijenos počinje na Ctrl+V.** `Ctrl+C` samo najavi datoteku — bajtovi
-kreću tek kad se zalijepi, jer se time zna i odredište. Za datoteku veću od 8 MB VM odmah
-stvori na odredištu datoteku točne veličine i stavi ju u međuspremnik, pa `Ctrl+V` radi
-odmah (kod ISO-a od 6,5 GB prije je trebalo čekati 3 min 19 s). U prozoru napretka na hostu
-tada piše `čeka se lijepljenje (Ctrl+V)`, a nakon lijepljenja prijenos ide punom brzinom
-točno na odabrano mjesto. Lijepi **unutar istog diska** — na drugi disk Explorer kopira
-umjesto premješta, pa kopija nastane dok je datoteka još prazna.
+**Cijela grupa ide u jednom Ctrl+V-u, i datoteka nikad ne nastane prazna.** VM ne stavlja
+u međuspremnik *putanju*. Sastavi **grupu datoteka** — opisnik s imenom i veličinom svake
+datoteke, i po jednu struju sadržaja za svaku (`FileGroupDescriptorW` + `FileContents`),
+isto ono što rade RDP i VMware. Explorer zato sadržaj čita iz struje koju mu most preda i
+našu datoteku u `Primljeno\` uopće ne dira. Iz toga slijedi:
+
+* lijepljenje **bilo kamo** — i na drugi disk — daje cijelu datoteku: nema
+  kopiraj-pa-obriši koji bi se izveo dok je datoteka još prazna;
+* **kopirana mapa i svaki višedatotečni odabir sliježu se u JEDNOM Ctrl+V-u**, sa
+  sačuvanom strukturom podmapa.
+
+Host prvo pošalje zaglavlja cijele grupe, pa je međuspremnik spreman čim je odabir
+najavljen, neovisno o veličini. Datoteka čiji bajtovi još pristižu neće biti krnja — ako
+čitatelj čita brže nego što veza dovodi, čeka — a `Ctrl+V` djeluje čim završi prijenos na
+koji čeka. Kad je svaka datoteka pročitana do kraja, kanal se povlači i `Primljeno\` se
+sam počisti. Ako nitko ne zalijepi unutar 10 minuta, kanal se povlači, a datoteke ostaju u
+`Primljeno\` — ništa se ne briše bez pitanja.
+
+Datoteke bačene u `Drop\` idu običnim putem za pojedinačnu datoteku i ovo ih ne dira.
 
 ### Koja strana sluša
 
@@ -434,9 +446,15 @@ međuspremniku korisnika.
 
 # samotest bez ikakve vanjske veze - pravi TCP spoj na 127.0.0.1:
 # tekst s dijakriticima u oba smjera, PNG, datoteka od 700 KB preko granice
-# komada od 256 KB (MD5), i sanitizacija imena
+# komada od 256 KB (MD5), sanitizacija imena, i opisnik za međuspremnik
+# provjeren bajt po bajt (pomaci, FD_UNICODE, veličine iznad 4 GB) te struja
+# sadržaja
 .\scripts\luxstream-bridge.ps1 -SelfTest
 ```
+
+Provjeru opisnika vrijedi pokrenuti prvo na stroju na kojem lijepljenje datoteka ne radi:
+to je jedini dio koji pada Glasno, a opisnik se piše ručno, bajt po bajt (`FILEDESCRIPTOR`
+je 592 bajta po datoteci, na fiksnim pomacima).
 
 Dnevnik je `%USERPROFILE%\Luxstream\luxstream-bridge.log`. Zapisuje se i **razlog zašto most
 nije krenuo** (npr. nema tajne) — inače bi kvar iz zakazanog zadatka bio potpuno nevidljiv.
