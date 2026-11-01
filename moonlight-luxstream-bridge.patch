@@ -22,8 +22,9 @@ The protocol (1 byte type, 4 byte little-endian length, payload):
   0x20 file header         (JSON {name, size, rel?})
   0x21 file chunk          (256 KB)
   0x22 file end
-  0x30 PAUZA  - vestigial, logged only   (JSON {name, size})
-  0x31 NASTAVI - vestigial, logged only  (empty)
+  0x30 PAUZA    - stop sending until the paste happens (JSON {name, size})
+  0x31 NASTAVI  - the user pasted, send again               (empty)
+  0x32 ODUSTANI - give the paused transfer up               (empty)
 
 HOW A PASTE WORKS NOW (changed 01.11.2026)
 
@@ -49,11 +50,47 @@ transfer, for a folder.
 Drop files and single files are unaffected: their header is still sent by
 pumpSend immediately before the first chunk.
 
-0x30 / 0x31 (PAUZA / NASTAVI) were added on 01.11.2026 for the earlier "hold the
-transfer until the paste happens" design.  The clipboard-group design does not
-need them: the whole point of it is that the receiver waits for nothing, because
-the listener pulls the bytes.  They are still parsed and logged so that an older
-peer is not surprised, but nothing sends them any more.
+0x30 / 0x31 (PAUZA / NASTAVI) belong to the VM's "hold the transfer until the
+paste happens" design: the VM publishes the descriptor, stops sending, and waits
+for its own FileContents stream to be read before pushing the bytes - the first
+Read on that stream is the paste.  The host parses both frames and logs them,
+but it never sends either: only the side that hands out the descriptor has a
+reason to hold.  The host gives a paused transfer 15 minutes, the VM gives its
+descriptor 10 (luxstream-bridge.ps1, -LazyCekajSec).
+
+WHY 0x32 EXISTS (added 01.11.2026, same day)
+
+0x32 (ODUSTANI - give up) closes the one hole that design left open, and it is
+the reason plain text copy stopped working.
+
+While a hold is up, BOTH sides stop polling their own clipboard: the VM sits in
+its loop waiting for the paste, and the host returns early from pollClipboard
+because txHeld is set.  For as long as the hold lasts, copying text does nothing
+in either direction, and copying an image does nothing either.  And it does not
+take a second mistake to keep it going: the host's m_LastHash is not carried
+across connections, so when the hold expires, the link drops, and the host
+reconnects, it announces the same file group again and the freeze starts over.
+Seen in the field: two full ten-minute windows (14:56-15:06 and 15:12-15:22)
+during which no transfer happened at all.
+
+The clipboard can only hold one thing at a time, so the fix cannot be "never
+interrupt a text copy".  It has to be: whatever the user copies next wins, and
+the far side is told to let go.
+
+  * VM side (luxstream-bridge.ps1): the outgoing clipboard poll is no longer
+    skipped while a descriptor is up.  Text or an image there means the user
+    moved on, so the group is abandoned and 0x32 goes out.  The same happens for
+    content that arrives from the network while a descriptor is up: the
+    descriptor is dropped and that content is applied at once, instead of being
+    queued behind it.  Copied FILES are left alone - those mean the user is
+    carrying on with the paused transfer, so the hold stays.
+  * host side (this file): pollClipboard no longer returns early on txHeld.
+    Text or an image on the clipboard cancels the queued job (cancelSend) and
+    sends 0x32.  Copied files leave the hold untouched, as on the VM.
+
+An older peer knows neither 0x32 nor the reason for it: it logs it as an unknown
+frame type and ignores it, so the transfer is given up on one side only and the
+other side degrades to the old waiting behaviour instead of breaking.
 
 The two sides therefore upgrade independently in one direction only: a new VM
 with an old host still works (headers arrive interleaved with data; the receiver
@@ -74,7 +111,6 @@ This is not a cosmetic change: the client has to be recompiled for the bridge to
 exist at all.  Luxstream-Moonlight-Host.exe ships the resulting Moonlight.exe
 prebuilt, so an end user never applies this patch - it is here so that the
 binary can be rebuilt from source.
-
 diff --git a/app/app.pro b/app/app.pro
 index 1c0661b..f2373c4 100644
 --- a/app/app.pro
@@ -97,10 +133,10 @@ index 1c0661b..f2373c4 100644
      cli/listapps.h \
 diff --git a/app/backend/luxbridge.cpp b/app/backend/luxbridge.cpp
 new file mode 100644
-index 0000000..a84c925
+index 0000000..ec89b93
 --- /dev/null
 +++ b/app/backend/luxbridge.cpp
-@@ -0,0 +1,2034 @@
+@@ -0,0 +1,2114 @@
 +// NOMINMAX has to be set before anything pulls in <windows.h>, or the min/max
 +// macros it defines eat std::min/std::max and Qt's own use of them.
 +#ifdef _WIN32
@@ -173,6 +209,20 @@ index 0000000..a84c925
 +// way round, degrades to the old behaviour instead of breaking.
 +static constexpr quint8 kFrameHold = 0x30;
 +static constexpr quint8 kFrameResume = 0x31;
++
++// Added 01.11.2026. The far side stops wanting the file the pause was holding
++// on. Normally that means its user copied something else instead of pasting:
++// the pause can last ten minutes, and for all of it the other side's bridge
++// stops polling its own clipboard as well (see Sync-Loop in
++// luxstream-bridge.ps1), so a plain text copy froze in BOTH directions. Seen
++// in the field: two full 10-minute windows (14:56-15:06 and 15:12-15:22 on
++// 01.11.2026.) during which copying text simply did nothing.
++//
++// Lifting the hold alone is not enough - kFrameResume would start pushing the
++// very file nobody is waiting for any more, so the queued job goes with it.
++// An older peer logs this as an unknown frame and ignores it, which leaves the
++// old behaviour intact instead of breaking.
++static constexpr quint8 kFrameAbandon = 0x32;
 +
 +// ---------------------------------------------------------------------------
 +// Progress window
@@ -1228,6 +1278,19 @@ index 0000000..a84c925
 +        break;
 +    }
 +
++    case kFrameAbandon:
++    {
++        // The far side gave up on the transfer it had asked us to pause, so
++        // nothing on the wire belongs to it any more. cancelSend drops the
++        // queued job too - see the note on kFrameAbandon.
++        const bool cekao = conn->txHeld;
++        cancelSend(conn);
++        log(QStringLiteral("  [.] %1: sugovornik je odustao - prijenos prekinut%2")
++                .arg(conn->peer)
++                .arg(cekao ? QStringLiteral(" (iz pauze)") : QString()));
++        break;
++    }
++
 +    default:
 +        log(QStringLiteral("  [!] nepoznat tip okvira %1").arg(type));
 +        break;
@@ -1767,6 +1830,40 @@ index 0000000..a84c925
 +    m_SkipUntilMs = QDateTime::currentMSecsSinceEpoch() + kPollMs;
 +}
 +
++// Drops everything this connection still had queued to send, lifts the pause
++// and closes the job. Called when the transfer is known to be pointless: the
++// far side said so (kFrameAbandon), or the clipboard did (see pollClipboard).
++//
++// Only TX state is touched. What already went into the socket stays there -
++// the receiver discards frames for a group it has abandoned, and lifting bytes
++// back out of a QTcpSocket is not something the API offers anyway.
++void LuxBridge::cancelSend(Connection* conn)
++{
++    if (conn == nullptr) {
++        return;
++    }
++
++    conn->txHeld = false;
++    conn->txHeldMs = 0;
++    conn->txProgressMs = QDateTime::currentMSecsSinceEpoch();
++
++    if (conn->txActive) {
++        conn->txFile.close();
++        conn->txActive = false;
++    }
++    conn->txQueue.clear();
++    conn->txCurrent = TxItem();
++    conn->txSent = 0;
++
++    // The group summary ("poslano N datoteka") must not fire for a group that
++    // was cancelled, so its counters go with the queue.
++    conn->grpLeft = 0;
++    conn->grpCount = 0;
++    conn->grpBytes = 0;
++
++    jobFinish();
++}
++
 +void LuxBridge::pollClipboard()
 +{
 +    if (QDateTime::currentMSecsSinceEpoch() < m_SkipUntilMs) {
@@ -1789,12 +1886,31 @@ index 0000000..a84c925
 +    }
 +
 +    // While the far side waits for its user to paste, its clipboard holds the
-+    // path we are about to fill - a text or image frame pushed now would wipe
-+    // exactly the thing the user is about to paste. m_LastHash is deliberately
-+    // NOT consumed here, so whatever was copied during the pause goes out on
-+    // its own once the transfer resumes.
++    // file group we are feeding. Pushing another clipboard content now would
++    // take that clipboard away mid-paste - but only for as long as the pause
++    // still makes sense.
++    //
++    // Text and images are the exception, and they are what this branch is here
++    // for. The pause may run for ten minutes, and for all of it the far side's
++    // bridge stops polling its own clipboard as well, so a plain text copy
++    // froze in BOTH directions (seen 01.11.2026.: two full 10-minute windows in
++    // which copying text simply did nothing, and every reconnect re-announced
++    // the same file because it was still on this clipboard).
++    //
++    // A text or an image on THIS clipboard therefore means the user moved on:
++    // the queued job is cancelled, kFrameAbandon tells the far side to drop its
++    // descriptor too, and the new content goes out below. Any other kind - in
++    // particular a fresh file copy - leaves the pause alone, and m_LastHash
++    // stays unconsumed so it travels once the transfer resumes.
 +    if (conn->txHeld) {
-+        return;
++        if (kind == ClipKind::Text || kind == ClipKind::Image) {
++            cancelSend(conn);
++            sendFrame(conn, kFrameAbandon, QByteArray());
++            log(QStringLiteral("  [.] %1: kopirano je nesto drugo - napustam prijenos").arg(conn->peer));
++        }
++        else {
++            return;
++        }
 +    }
 +
 +    switch (kind) {
@@ -2137,10 +2253,10 @@ index 0000000..a84c925
 +}
 diff --git a/app/backend/luxbridge.h b/app/backend/luxbridge.h
 new file mode 100644
-index 0000000..0d48ee2
+index 0000000..7bafee0
 --- /dev/null
 +++ b/app/backend/luxbridge.h
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,380 @@
 +#pragma once
 +
 +#include <QByteArray>
@@ -2352,6 +2468,13 @@ index 0000000..0d48ee2
 +
 +    // Ends the file currently on the wire: end frame, close, move-if-Drop.
 +    void finishCurrentSend(Connection* conn);
++
++    // Drops everything this connection still had queued to send and lifts the
++    // pause. Used both when the far side says it gave up (kFrameAbandon) and
++    // when the clipboard proves the user moved on (see pollClipboard). Without
++    // it the job would sit in txQueue for ever and start feeding a file nobody
++    // is waiting for the moment anything else lifted the hold.
++    void cancelSend(Connection* conn);
 +
 +    void pollClipboard();
 +    void pollDropFolder();

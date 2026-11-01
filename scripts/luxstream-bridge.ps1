@@ -1821,34 +1821,26 @@ function Ocisti-Primljeno($grupa) {
   if ($obrisano -gt 0) { Log ("  [.] pocisceno {0} datoteka iz Primljeno\" -f $obrisano) }
 }
 
-# Tekst i slika koji stignu DOK kanal za datoteke stoji.
+# Napustanje opisnika koji ceka lijepljenje.
 #
-# Meduspremnik u tom trenutku drzi opisnik grupe koju korisnik upravo lijepi.
-# Postaviti tekst preko toga znaci pojesti upravo ono sto korisnik lijepi.
-# Zato se takav sadrzaj ne odbacuje nego ODGADA - primijeni se odmah nakon sto
-# se kanal zatvori. U praksi se ovo ne bi trebalo ni dogoditi: host ne salje
-# meduspremnik dok kanal stoji (vidi pollClipboard u luxbridge.cpp). Ovo je
-# druga linija obrane, za stariji host koji to ne provjerava.
-function Odgodi-Meduspremnik([string]$vrsta, $sadrzaj) {
-  $script:Odgoda = @{ Vrsta = $vrsta; Sadrzaj = $sadrzaj }
-  Log ("  [.] {0} iz mreze odgodjen dok traje cekanje na lijepljenje" -f $vrsta)
-}
-
-function Primijeni-Odgodu {
-  if (-not $script:Odgoda) { return }
-  $o = $script:Odgoda
-  $script:Odgoda = $null
-  if ($o.Vrsta -eq 'text') {
-    if (Postavi-Tekst $o.Sadrzaj) {
-      Log ("  <- (odgodjeni) tekst {0} B" -f ([Text.Encoding]::UTF8.GetByteCount($o.Sadrzaj)))
-      Zapamti-Poznati @{ Vrsta = 'text'; Tekst = $o.Sadrzaj }
-    }
-  } elseif ($o.Vrsta -eq 'image') {
-    if (Postavi-Sliku $o.Sadrzaj) {
-      Log ("  <- (odgodjena) slika {0} B" -f $o.Sadrzaj.Length)
-      Zapamti-Trenutni ('I' + (Hash ([Convert]::ToBase64String($o.Sadrzaj))))
-    }
-  }
+# Opisnik drzi meduspremnik ZAROBLJENIM dok korisnik ne zalijepi - rok je 10
+# minuta. Cijelo to vrijeme nista drugo ne prolazi kroz meduspremnik: ni tekst
+# ni slika, ni u jednom smjeru (vidi Sync-Loop i pollClipboard u luxbridge.cpp).
+# Ako bas u tom prozoru stigne novi sadrzaj - s druge strane, ili ga korisnik
+# ovdje sam kopira - to je jasan znak da je presao na drugo, pa se stara grupa
+# napusta odmah, umjesto da se ceka istek roka.
+#
+# Bez ovoga je nalet izgledao ovako (vidjeno u VM-u 01.11.2026., dva puta):
+#   14:56:16  -> pauza: cekam Ctrl+V prije nego krene sadrzaj
+#   15:06:17  [.] nitko nije zalijepio 600 s - opisnik povucen
+#   15:12:18  -> pauza: cekam Ctrl+V prije nego krene sadrzaj      <- opet
+#   15:22:19  [.] nitko nije zalijepio 600 s
+# a korisnik za to vrijeme nije mogao kopirati ni obican tekst.
+function Napusti-Opisnik([string]$razlog) {
+  if (-not $script:Grupa -or -not $script:Grupa.Opisnik) { return $false }
+  Log ("  [.] napustam opisnik ({0}) - vracam meduspremnik" -f $razlog)
+  Zatvori-Opisnik $script:Grupa
+  return $true
 }
 
 # ------------------------------------------------------------ slanje datoteke
@@ -2256,6 +2248,10 @@ $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     (($tPauza -match 'Send-Frame \$stream 0x30') -and ($tPauza -match 'BezPauze'))
   T 'pauza: NASTAVI ide na prvi Read (Citanja)' `
     (($tNast -match 'Send-Frame \$stream 0x31') -and ($tNast -match 'Citanja\(\)'))
+  $tNapust = ''
+  try { $tNapust = (Get-Command Napusti-Opisnik -CommandType Function).Definition } catch { }
+  T 'pauza: opisnik se napusta kad stigne novi sadrzaj' `
+    (($tNapust -match 'Zatvori-Opisnik') -and ($tNapust -match 'napustam opisnik'))
 
   try {
     $zag = Receive-Frame $a
@@ -2353,10 +2349,25 @@ $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     T 'opisnik: ime druge nosi podmapu' ($ime2 -eq 'pocetak/pod/b.txt')
 
     # --- isti opisnik mora izaci i kroz GetData (HGLOBAL), ne samo iz ruke ---
+    #
+    # POZOR: u GetData se opisnik gradi IZNKOVA, pa ftLastWriteTime u njemu
+    # nikad nije jednak onome iz ruke - oba nose "sada". Usporedba zato gleda
+    # sve OSIM tog polja. Ono sto se ovdje provjerava je da GetData vrati isti
+    # opisnik, a ne da dva poziva u istoj sekundi daju isti vremenski zig.
     $bg = [LuxShim.LuxClip]::MedijZaTest($opisTest, -1)
-    T 'opisnik: GetData daje isti opisnik' (
-      ($bg.Length -eq $bz.Length) -and
-      ([Convert]::ToBase64String($bg) -eq [Convert]::ToBase64String($bz)))
+    $istoOpisnik = ($bg.Length -eq $bz.Length)
+    if ($istoOpisnik) {
+      $bzK = [byte[]]$bz.Clone()
+      $bgK = [byte[]]$bg.Clone()
+      for ($k = 0; $k -lt 2; $k++) {
+        for ($j = 0; $j -lt 8; $j++) {
+          $bzK[4 + $k * 592 + 56 + $j] = 0
+          $bgK[4 + $k * 592 + 56 + $j] = 0
+        }
+      }
+      $istoOpisnik = ([Convert]::ToBase64String($bgK) -eq [Convert]::ToBase64String($bzK))
+    }
+    T 'opisnik: GetData daje isti opisnik' $istoOpisnik
 
     # --- koje formate nudimo: fgdw + po jedan filecontents po datoteci + pdde ---
     $nFmt = [LuxShim.LuxClip]::FormatEtaBrojZaTest()
@@ -2374,12 +2385,14 @@ $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
     $citanja = 0
     try {
       $ls = New-Object LuxShim.LuxStream -ArgumentList @($stIzvor, 0, [int64]$stBytes.Length)
+      # Kratak komad NIJE kraj: struja javlja kraj tek kad SLJEDECI Read vrati 0.
+      # Petlja je prije izlazila na kratkom komadu, pa se taj zavrsni Read nikad
+      # nije ni dogodio - i test je padao uvijek, iako je kanal bio u redu.
       while ($citanja -lt 1000) {
         $ls.Read($buf, $buf.Length, $pn)
         $got = [Runtime.InteropServices.Marshal]::ReadInt32($pn)
         if ($got -le 0) { break }
         $ms.Write($buf, 0, $got)
-        if ($got -lt $buf.Length) { break }      # zadnji komad
         $citanja++
       }
     } finally {
@@ -2747,7 +2760,7 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
   Zatvori-Sve
   if ($biloGrupe) { Log '  [!] prethodna grupa nije dovrsena - pocisceno iz Primljeno\' }
 
-  $script:Odgoda = $null     # tekst/slika koji cekaju kraj pauze (vidi Odgodi-Meduspremnik)
+
   $zadnjiDrop = @{}          # sto je iz Drop-a vec poslano (ime|duljina|vrijeme)
   $script:ZadnjiHash = Prezivjeli-Hash (Dohvati-Meduspremnik)
   $script:PreskociDo = [datetime]::MinValue
@@ -2768,9 +2781,7 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
     if ($script:Grupa -and $script:Grupa.Opisnik) {
       Provjeri-Opisnik $script:Grupa $stream
     }
-    # Odgodjeni tekst/slika se primjenjuju cim kanal vise nije zauzet. Provjera
-    # ide svaki okretaj, a funkcija odmah izlazi kad nema nista odgodjeno.
-    if (-not ($script:Grupa -and $script:Grupa.Opisnik)) { Primijeni-Odgodu }
+
 
     # ---- 1. dolazno
     try {
@@ -2782,11 +2793,12 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           0x10 {
             $t = [Text.Encoding]::UTF8.GetString($f.Payload)
             if ($t.Length -le $MaxTextBytes) {
-              # Dok opisnik stoji, meduspremnik drzi datoteke koje korisnik
-              # upravo lijepi - tekst preko toga pojede upravo njih.
-              if ($script:Grupa -and $script:Grupa.Opisnik) {
-                Odgodi-Meduspremnik 'text' $t
-              } elseif (Postavi-Tekst $t) {
+              # Tekst stize dok opisnik stoji: korisnik na drugoj strani je
+              # ocito presao na drugo. Opisnik se napusta odmah - odgadanje bi
+              # meduspremnik drzalo mrtvim do isteka roka (do 10 min), a tekst
+              # bi na kraju bio primijenjen nad vec napustenom grupom.
+              Napusti-Opisnik 'stigao tekst iz mreze'
+              if (Postavi-Tekst $t) {
                 $p = if ($t.Length -gt 40) { $t.Substring(0,40) + '...' } else { $t }
                 Log ("  <- tekst {0} B  {1}" -f $f.Payload.Length, ($p -replace '\r?\n',' '))
                 Zapamti-Poznati @{ Vrsta = 'text'; Tekst = $t }
@@ -2795,9 +2807,10 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           }
           0x11 {
             if ($f.Payload.Length -le $MaxImageBytes) {
-              if ($script:Grupa -and $script:Grupa.Opisnik) {
-                Odgodi-Meduspremnik 'image' $f.Payload
-              } elseif (Postavi-Sliku $f.Payload) {
+              # Isto kao kod teksta: slika iz mreze znaci da je druga strana
+              # presla na drugo, pa se opisnik napusta odmah.
+              Napusti-Opisnik 'stigla slika iz mreze'
+              if (Postavi-Sliku $f.Payload) {
                 Log ("  <- slika {0} B" -f $f.Payload.Length)
                 # Slika zadrzava ponovno citanje, ali uz poznati hash kao
                 # rezervu ako citanje vrati 'N' - vidi Zapamti-Trenutni.
@@ -2897,6 +2910,14 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
           0x31 {
             Log ("  [.] sugovornik je rekao NASTAVI")
           }
+          0x32 {
+            # Sugovornik je odustao od prijenosa koji je pokrenuo. Na ovoj
+            # strani je POSILJATELJ (jedna veza nosi jedan prijenos u jednom
+            # smjeru), pa se tu nema sto zaustavljati - ali ako opisnik ovdje
+            # stoji, on se skida.
+            Log ("  [.] sugovornik je odustao od prijenosa")
+            [void](Napusti-Opisnik 'sugovornik je odustao')
+          }
           default { Log ("  [!] nepoznat tip okvira {0}" -f $f.Tip) }
         }
       }
@@ -2907,15 +2928,27 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
     #
     # Dok opisnik stoji, meduspremnik je ZAUZET: u njemu su datoteke koje
     # korisnik upravo lijepi, a citaju se iz ovog procesa (proxy na nasu
-    # struju). Poslati u tom trenutku bilo sto iz naseg meduspremnika znacilo
-    # bi pregaziti upravo taj opisnik - i korisnikovo lijepljenje bi puklo.
-    # Hash se zato ne trosi: sve sto je korisnik kopirao za vrijeme dok kanal
-    # stoji ide van odmah nakon sto se kanal zatvori.
-    if (-not $NoClipboard -and (Get-Date) -gt $script:PreskociDo -and
-        -not ($script:Grupa -and $script:Grupa.Opisnik)) {
+    # struju). Zato kopirane DATOTEKE u tom prozoru ne idu nikamo - jedan spoj
+    # nosi jedan prijenos.
+    #
+    # Tekst i slika su iznimka. Opisnik moze cekati 10 minuta, a cijelo to
+    # vrijeme nista ne prolazi kroz meduspremnik - ni u jednom smjeru. Ako je
+    # korisnik OVDJE u meduvremenu kopirao tekst ili sliku, jasno je da je
+    # presao na drugo: grupa se napusta i druga se strana o tome obavjestava
+    # (0x32), a novi sadrzaj ide odmah.
+    #
+    # Vlastiti opisnik se ne vidi kao CF_HDROP, pa 'files' ovdje uvijek znaci
+    # da je korisnik STVARNO kopirao datoteke.
+    if (-not $NoClipboard -and (Get-Date) -gt $script:PreskociDo) {
       $s = Dohvati-Meduspremnik
       $h = Prezivjeli-Hash $s
-      if ($h -ne $script:ZadnjiHash -and $h -ne 'N') {
+      $zauzeto = [bool]($script:Grupa -and $script:Grupa.Opisnik)
+      if (-not ($zauzeto -and $s.Vrsta -eq 'files') -and
+          $h -ne $script:ZadnjiHash -and $h -ne 'N') {
+        if ($zauzeto -and (Napusti-Opisnik ('ovdje kopirano: ' + $s.Vrsta))) {
+          Send-Frame $stream 0x32 @()
+          Log '  -> ODUSTANI: stara grupa napustena, saljem novi sadrzaj'
+        }
         switch ($s.Vrsta) {
           'text' {
             if ($s.Tekst.Length -le $MaxTextBytes) {
