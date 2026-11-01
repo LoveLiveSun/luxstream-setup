@@ -705,9 +705,15 @@ namespace LuxShim
         public void LockRegion(long libOffset, long cb, int dwLockType) { }
         public void UnlockRegion(long libOffset, long cb, int dwLockType) { }
 
-        public void Stat(out STATSTG pstatstg, int grfStatFlag)
+        // STATSTG se ovdje MORA pisati punim imenom. .NET Framework ima DVije
+        // istoimene strukture - System.Runtime.InteropServices.STATSTG (stara) i
+        // System.Runtime.InteropServices.ComTypes.STATSTG (ova koja nam treba) -
+        // a oba su imenska prostora uvezena na vrhu. Kratko ime je zato
+        // dvosmisleno i Add-Type padne s CS0104, cime cijeli LuxShim ne nastane
+        // i kanal za datoteke tiho ostane mrtav. (Vidjeno u VM-u 01.11.2026.)
+        public void Stat(out System.Runtime.InteropServices.ComTypes.STATSTG pstatstg, int grfStatFlag)
         {
-            pstatstg = new STATSTG();
+            pstatstg = new System.Runtime.InteropServices.ComTypes.STATSTG();
             pstatstg.type = 2;                       // STGTY_STREAM
             pstatstg.cbSize = _fs.Length;
         }
