@@ -2855,6 +2855,25 @@ function Sync-Loop($klijent, $stream, [string]$uloga) {
   }
 }
 
+# ---- DVA MOSTA NA ISTOM STROJU: prijava, ne samoubojstvo -------------------
+# Zadatak se pokrece preko VBS omotaca, pa Stop-ScheduledTask zaustavi ZADATAK,
+# ali NE i powershell koji je iz njega pokrenut. Zaostali proces ostane spojen
+# na drugu stranu; kad se pokrene novi, oba se otimaju o istu vezu - host pri
+# svakom novom spoju zatvori stariju ("se ponovno spojio - zatvaram 1 stariju
+# vezu"), a u dnevniku se to vidi kao spoj/pukni svakih nekoliko sekundi.
+# (Vidjeno u VM-u 01.11.2026. nakon prve nadogradnje mosta.)
+#
+# Ovdje se drugi proces samo PRIJAVI. Namjerno se ne gasi sam: kod nadogradnje
+# novi proces krece dok je stari jos ziv, pa bi samoubojstvo ostavilo stroj bez
+# ijednog mosta. Gasenje zaostalih je posao nadogradnje (VM-nadogradi-most.ps1).
+try {
+  $drugi = @(Nadji-Proces)
+  if ($drugi.Count -gt 0) {
+    Log ("  [!] vec radi {0} drugi proces mosta (PID {1}) - dva mosta na istoj vezi se otimaju" -f `
+         $drugi.Count, (($drugi | ForEach-Object { $_.ProcessId }) -join ', '))
+  }
+} catch { }
+
 switch ($Mode) {
   # Ugnijezdjeni C# se sastavlja prije prve veze, a ne u njoj: sastavljanje
   # zna potrajati, a u Sync-Loopu bi taj zastoj izgledao kao mrtva veza.
